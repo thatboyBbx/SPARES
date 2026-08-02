@@ -1,0 +1,23 @@
+# --- Python ---
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.env
+apps/api/.venv/
+*.sqlite3
+
+# --- Node / Vite ---
+node_modules/
+dist/
+dist-ssr/
+*.local
+apps/web/.env
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+
+# --- Docker ---
+infra/.env

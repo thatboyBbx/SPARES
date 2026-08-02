@@ -1,0 +1,81 @@
+# SPOP local development stack.
+#
+# Usage: docker compose -f infra/docker-compose.yml up
+#
+# Brings up: Postgres, Redis, the FastAPI backend (with hot reload), and
+# the Vite dev server (with HMR). This is a development stack only — no
+# production hardening (secrets management, resource limits, replicas)
+# has been applied. See infra/README.md before using any of this beyond
+# a developer's own machine.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: spop
+      POSTGRES_PASSWORD: spop
+      POSTGRES_DB: spop
+    ports:
+      - "5432:5432"
+    volumes:
+      - spop_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spop"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ../apps/api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://spop:spop@postgres:5432/spop
+      REDIS_URL: redis://redis:6379/0
+      ENVIRONMENT: development
+      DEBUG: "true"
+      JWT_SECRET_KEY: local-dev-secret-do-not-use-in-production
+      ALLOWED_ORIGINS: '["http://localhost:5173"]'
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../apps/api:/app
+    command:
+      ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+  web:
+    build:
+      context: ../apps/web
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      - "5173:5173"
+    volumes:
+      - ../apps/web:/app
+      - /app/node_modules
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+
+volumes:
+  spop_postgres_data:

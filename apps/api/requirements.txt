@@ -1,0 +1,26 @@
+# --- Core web framework ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# --- Database ---
+sqlalchemy==2.0.36
+alembic==1.14.0
+psycopg[binary]==3.2.3
+
+# --- Validation / settings ---
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# --- Auth ---
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.20
+
+# --- Background jobs / cache ---
+celery==5.4.0
+redis==5.2.1
+
+# --- Dev / test ---
+pytest==8.3.4
+pytest-asyncio==0.25.0
+httpx==0.28.1
