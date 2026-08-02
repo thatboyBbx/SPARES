@@ -70,6 +70,7 @@ deployment.
 cd apps/api
 pip install -r requirements.txt --break-system-packages
 cp .env.example .env   # adjust DATABASE_URL to a local Postgres instance
+alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
@@ -83,7 +84,11 @@ npm run dev
 ## Database migrations
 
 Migrations are managed with Alembic, wired to the SQLAlchemy models
-under `apps/api/app/models/`.
+under `apps/api/app/models/`. Alembic is authoritative for Postgres —
+the Docker Compose `api` service runs `alembic upgrade head` before
+`uvicorn` starts on every boot. (`Base.metadata.create_all()` still runs
+too, purely as a no-op fallback for the SQLite test suite, which never
+runs Alembic.)
 
 ```bash
 cd apps/api

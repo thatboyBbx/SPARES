@@ -24,9 +24,8 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, Integer, String
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
 
 class Base(DeclarativeBase):
@@ -62,11 +61,11 @@ class SyncedEntityMixin:
     that are never created on-device (e.g. a static list of currencies).
     """
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        PG_UUID(as_uuid=True),
+    id: Mapped[str] = mapped_column(
+        String(36),
         primary_key=True,
-        default=uuid.uuid4,
-        comment="Client-generatable UUID — never an auto-increment integer.",
+        default=lambda: str(uuid.uuid4()),
+        comment="Client-generatable UUID (string form, portable across Postgres/SQLite) — never an auto-increment integer.",
     )
 
     device_id: Mapped[str] = mapped_column(
@@ -75,10 +74,11 @@ class SyncedEntityMixin:
         comment="Identifier of the device that created/last touched this row.",
     )
 
-    created_by_id: Mapped[uuid.UUID] = mapped_column(
-        PG_UUID(as_uuid=True),
+    created_by_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.id"),
         nullable=False,
-        comment="FK-like reference to users.id (declared as a real FK in subclasses).",
+        comment="Which user performed the action.",
     )
 
     created_at: Mapped[datetime] = mapped_column(
@@ -107,3 +107,12 @@ class SyncedEntityMixin:
         nullable=False,
         comment="SYNCED when written directly server-side; PENDING when queued from a device.",
     )
+
+
+@event.listens_for(SyncedEntityMixin, "before_update", propagate=True)
+def _bump_version(_mapper: object, _connection: object, target: SyncedEntityMixin) -> None:
+    """Single source of truth for version increments — conflict detection on
+    write endpoints compares a client-supplied expected_version against this
+    value, so every mutation must go through this listener rather than
+    endpoints setting `version` themselves."""
+    target.version += 1
