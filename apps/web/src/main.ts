@@ -1,9 +1,11 @@
 import "./index.css";
 import "./App.css";
-import { createApproval, createExpense, createPurchaseOrder, db, loadFromServer, markNotificationRead, pendingSyncCount, receivePurchaseOrder, recordReceipt, recordSale, recordTransfer, type Branch, type Notification, type Product, type PurchaseOrder, type StockMovement, type Supplier, type Transfer } from "./db/database";
+import { cancelTransfer, createApproval, createExpense, createPurchaseOrder, db, fulfilTransfer, loadFromServer, markNotificationRead, pendingSyncCount, receivePurchaseOrder, receiveTransfer, recordReceipt, recordSale, recordTransfer, type Branch, type Notification, type Product, type PurchaseOrder, type StockMovement, type Supplier, type Transfer } from "./db/database";
 import { getCurrentUser, login, logout, registerDevice, request, type AuthUser } from "./lib/api";
 
 type View = "overview" | "catalogue" | "receipt" | "transfer" | "sale" | "approval" | "expense" | "ledger" | "purchase" | "notifications" | "users";
+const TRANSFER_FULFIL_ROLES = ["owner", "store_keeper", "super_admin"];
+const TRANSFER_RECEIVE_ROLES = ["owner", "store_keeper", "shop_manager", "super_admin"];
 const VIEW_ROLES: Record<View, string[] | null> = {
   overview: null,
   catalogue: null,
@@ -103,7 +105,7 @@ function title() {
     overview: "Morning control room",
     catalogue: "Parts & vehicle fitment",
     receipt: "Receive supplier stock",
-    transfer: "Move stock between branches",
+    transfer: "Request, fulfil & receive branch transfers",
     sale: "Record a shop sale",
     approval: "Approval queue",
     expense: "Record operating expense",
@@ -118,7 +120,13 @@ function content() {
   if (view === "overview") { const low = products.filter((item) => stock(item.id, shop?.id) <= item.reorderLevel); const sales = movements.filter((item) => item.kind === "sale").reduce((sum, item) => sum + (product(item.productId)?.sellingPrice ?? 0) * -item.quantity, 0); return `<div class="metrics"><section class="metric"><small>Parts catalogued</small><strong>${products.length}</strong><span>with exact vehicle fitment</span></section><section class="metric"><small>Sales recorded</small><strong>${money.format(sales)}</strong><span>from the stock ledger</span></section><section class="metric"><small>Needs replenishment</small><strong>${low.length}</strong><span>at or below shop reorder level</span></section></div><div class="grid"><section class="card"><div class="card-title"><h2>Shop replenishment watch</h2><span>${escape(shop?.name ?? "No shop")}</span></div>${low.map((item) => `<div class="row"><div><strong>${escape(item.name)}</strong><small>${escape(item.fitment)}</small></div><b class="danger">${stock(item.id, shop?.id)} left</b></div>`).join("") || "<p>No low-stock parts.</p>"}</section><section class="card"><div class="card-title"><h2>Transfer evidence</h2><span>${transfers.length} recorded</span></div>${transfers.slice(0, 4).map((item) => `<div class="row"><div><strong>${escape(item.id)} · ${escape(product(item.productId)?.name ?? "Part")}</strong><small>${item.quantity} units</small></div><b class="good">${escape(item.status)}</b></div>`).join("") || "<p>No transfers yet.</p>"}</section><section class="card"><div class="card-title"><h2>Purchasing & inbox</h2><span>${purchaseOrders.filter((order) => order.status === "pending").length} pending orders</span></div><div class="row"><div><strong>${purchaseOrders.filter((order) => order.status === "pending").length} pending purchase orders</strong><small>${notifications.filter((item) => !item.read).length} unread notifications</small></div></div></section></div>`; }
   if (view === "catalogue") return `<section class="card table-card"><div class="card-title"><h2>Fitment-first catalogue</h2><span>${products.length} active parts</span></div><table><thead><tr><th>Part / SKU</th><th>Vehicle fitment</th><th>Warehouse</th><th>Shop</th><th>Sell</th></tr></thead><tbody>${products.map((item) => `<tr><td><strong>${escape(item.name)}</strong><small>${escape(item.brand)} · ${escape(item.sku)}</small></td><td>${escape(item.fitment)}</td><td>${stock(item.id, warehouse?.id)}</td><td>${stock(item.id, shop?.id)}</td><td>${money.format(item.sellingPrice)}</td></tr>`).join("")}</tbody></table></section>`;
   if (view === "receipt") return form("Goods receipt", "receipt-form", `<label>Part<select name="product">${options(products)}</select></label><label>Supplier<select name="supplier">${options(suppliers)}</select></label><label>Quantity<input name="quantity" type="number" min="1" value="1" required></label>`, "Post goods receipt");
-  if (view === "transfer") return form("Warehouse to shop transfer", "transfer-form", `<label>Part<select name="product">${options(products)}</select></label><label>Quantity<input name="quantity" type="number" min="1" value="1" required></label><p class="hint">Creates matched outbound and inbound ledger events.</p>`, "Confirm transfer");
+  if (view === "transfer") {
+    const canFulfil = TRANSFER_FULFIL_ROLES.includes(currentUser?.role ?? "");
+    const canReceive = TRANSFER_RECEIVE_ROLES.includes(currentUser?.role ?? "");
+    const requested = transfers.filter((item) => item.status === "requested");
+    const inTransit = transfers.filter((item) => item.status === "in_transit");
+    return `${form("Request a branch transfer", "transfer-form", `<label>Part<select name="product">${options(products)}</select></label><label>Quantity<input name="quantity" type="number" min="1" value="1" required></label><p class="hint">Creates a pending request; stock only moves once fulfilled and received.</p>`, "Request transfer")}<section class="card table-card"><div class="card-title"><h2>Awaiting fulfilment</h2><span>${requested.length} pending</span></div><table><thead><tr><th>Reference</th><th>Part</th><th>Quantity</th><th>Action</th></tr></thead><tbody>${requested.map((item) => `<tr><td>${escape(item.reference)}</td><td>${escape(product(item.productId)?.name ?? "Part")}</td><td>${item.quantity}</td><td>${canFulfil ? `<button class="secondary fulfil-transfer" data-transfer-id="${escape(item.id)}">Fulfil</button> <button class="secondary cancel-transfer" data-transfer-id="${escape(item.id)}">Cancel</button>` : "—"}</td></tr>`).join("") || "<tr><td colspan=\"4\">No pending requests.</td></tr>"}</tbody></table></section><section class="card table-card"><div class="card-title"><h2>In transit</h2><span>${inTransit.length} awaiting receipt</span></div><table><thead><tr><th>Reference</th><th>Part</th><th>Quantity</th><th>Action</th></tr></thead><tbody>${inTransit.map((item) => `<tr><td>${escape(item.reference)}</td><td>${escape(product(item.productId)?.name ?? "Part")}</td><td>${item.quantity}</td><td>${canReceive ? `<button class="secondary receive-transfer" data-transfer-id="${escape(item.id)}">Receive</button>` : "—"}</td></tr>`).join("") || "<tr><td colspan=\"4\">Nothing in transit.</td></tr>"}</tbody></table></section>`;
+  }
   if (view === "sale") return form("Counter sale", "sale-form", `<label>Part<select name="product">${options(products)}</select></label><label>Quantity<input name="quantity" type="number" min="1" value="1" required></label><p class="hint">Only available shop stock can be issued.</p>`, "Issue sale receipt");
   if (view === "approval") return form("Request an approval", "approval-form", `<label>Type<select name="type"><option>stock adjustment</option><option>price change</option><option>expense</option></select></label><label>Subject<input name="subject" required></label><label>Requester<input name="requester" required></label><label>Approver<input name="approver" required></label><label>Priority<select name="priority"><option>normal</option><option>high</option></select></label>`, "Send for approval");
   if (view === "expense") return form("Record an operating expense", "expense-form", `<label>Branch<select name="branch">${options(branches)}</select></label><label>Category<select name="category"><option>delivery</option><option>utilities</option><option>maintenance</option></select></label><label>Amount (USD)<input name="amount" type="number" min="0.01" step="0.01" required></label><label>Description<input name="description" required></label>`, "Record expense");
@@ -190,9 +198,48 @@ function bind() {
     const form = event.currentTarget as HTMLFormElement;
     await recordTransfer(value(form, "product"), branch("warehouse")!.id, branch("shop")!.id, Number(value(form, "quantity")));
     await refresh();
-    view = "ledger";
-    render("Transfer saved or queued for sync.");
+    view = "transfer";
+    render("Transfer requested or queued for sync.");
   });
+
+  root.querySelectorAll<HTMLButtonElement>(".fulfil-transfer").forEach((button) => button.addEventListener("click", async () => {
+    const transferId = button.dataset.transferId;
+    if (!transferId) return;
+    try {
+      await fulfilTransfer(transferId);
+      await refresh();
+      view = "transfer";
+      render("Transfer fulfilled and stock moved out.");
+    } catch (error) {
+      render(error instanceof Error ? error.message : "Could not fulfil transfer.");
+    }
+  }));
+
+  root.querySelectorAll<HTMLButtonElement>(".receive-transfer").forEach((button) => button.addEventListener("click", async () => {
+    const transferId = button.dataset.transferId;
+    if (!transferId) return;
+    try {
+      await receiveTransfer(transferId);
+      await refresh();
+      view = "ledger";
+      render("Transfer received into stock.");
+    } catch (error) {
+      render(error instanceof Error ? error.message : "Could not receive transfer.");
+    }
+  }));
+
+  root.querySelectorAll<HTMLButtonElement>(".cancel-transfer").forEach((button) => button.addEventListener("click", async () => {
+    const transferId = button.dataset.transferId;
+    if (!transferId) return;
+    try {
+      await cancelTransfer(transferId);
+      await refresh();
+      view = "transfer";
+      render("Transfer cancelled.");
+    } catch (error) {
+      render(error instanceof Error ? error.message : "Could not cancel transfer.");
+    }
+  }));
 
   root.querySelector<HTMLFormElement>("#sale-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();

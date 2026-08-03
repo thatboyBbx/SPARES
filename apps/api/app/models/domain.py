@@ -6,10 +6,10 @@ the append-only ``stock_movements`` ledger.
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.db.base import Base
+from app.db.base import Base, SyncedEntityMixin
 
 
 def utcnow() -> datetime:
@@ -31,19 +31,29 @@ class Supplier(Base):
     phone: Mapped[str] = mapped_column(String(50), default="")
 
 
-class Product(Base):
+class Category(SyncedEntityMixin, Base):
+    __tablename__ = "categories"
+    name: Mapped[str] = mapped_column(String(120))
+    parent_id: Mapped[str | None] = mapped_column(ForeignKey("categories.id"), nullable=True)
+
+
+class Product(SyncedEntityMixin, Base):
     __tablename__ = "products"
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     sku: Mapped[str] = mapped_column(String(80), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(160))
     brand: Mapped[str] = mapped_column(String(100))
     fitment: Mapped[str] = mapped_column(Text)
     reorder_level: Mapped[int] = mapped_column(Integer, default=0)
     selling_price: Mapped[float] = mapped_column(Float)
+    category_id: Mapped[str | None] = mapped_column(ForeignKey("categories.id"), nullable=True, index=True)
 
 
 class StockMovement(Base):
     __tablename__ = "stock_movements"
+    # Real-time SUM() over the ledger is used for balances rather than a
+    # materialized quantity column, to keep the ledger the single source of
+    # truth; this composite index keeps that aggregation cheap per branch.
+    __table_args__ = (Index("ix_stock_movements_product_branch", "product_id", "branch_id"),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     product_id: Mapped[str] = mapped_column(ForeignKey("products.id"), index=True)
     branch_id: Mapped[str] = mapped_column(ForeignKey("branches.id"), index=True)
@@ -89,17 +99,21 @@ class PurchaseOrderLine(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
-class Transfer(Base):
+class Transfer(SyncedEntityMixin, Base):
+    """Two-step workflow: requested -> in_transit -> received (or cancelled
+    before fulfilment). `created_by_id` (from the mixin) is the requester;
+    `created_at` is the request time."""
     __tablename__ = "transfers"
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     reference: Mapped[str] = mapped_column(String(80), unique=True)
     product_id: Mapped[str] = mapped_column(ForeignKey("products.id"))
     from_branch_id: Mapped[str] = mapped_column(ForeignKey("branches.id"))
     to_branch_id: Mapped[str] = mapped_column(ForeignKey("branches.id"))
     quantity: Mapped[int] = mapped_column(Integer)
     idempotency_key: Mapped[str | None] = mapped_column(String(80), unique=True, nullable=True)
-    status: Mapped[str] = mapped_column(String(30), default="received")
-    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    status: Mapped[str] = mapped_column(String(30), default="requested")
+    fulfilled_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    received_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    fulfilled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 

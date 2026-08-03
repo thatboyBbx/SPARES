@@ -19,9 +19,10 @@ def seed_database(db: Session) -> None:
         password = user.pop("password")
         role = UserRole(user.pop("role"))
         db.add(User(**user, role=role, hashed_password=hash_password(password)))
+    owner_id = next(row["id"] for row in data["users"] if row["role"] == "owner")
     db.add_all([Branch(**row) for row in data["branches"]])
     db.add_all([Supplier(**row) for row in data["suppliers"]])
-    db.add_all([Product(**row) for row in data["products"]])
+    db.add_all([Product(**row, device_id="system-import", created_by_id=owner_id) for row in data["products"]])
     db.flush()
     for row in data["receipts"]:
         receipt = PurchaseReceipt(**row)

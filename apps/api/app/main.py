@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Annotated
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -12,11 +12,16 @@ from sqlalchemy.orm import Session
 
 from app.core.auth import create_access_token, create_refresh_token, get_current_user, hash_password, require_roles, revoke_refresh_token, rotate_refresh_token, verify_and_upgrade_password
 from app.core.config import get_settings
-from app.core.permissions import CAN_APPROVE, CAN_MANAGE_STOCK_RECEIPTS, CAN_MANAGE_USERS, CAN_RECORD_SALE, CAN_REQUEST_TRANSFER
+from app.core.permissions import CAN_APPROVE, CAN_FULFIL_TRANSFER, CAN_MANAGE_STOCK_RECEIPTS, CAN_MANAGE_USERS, CAN_RECEIVE_TRANSFER, CAN_RECORD_SALE, CAN_REQUEST_TRANSFER
 from app.db.base import Base
 from app.db.session import engine, get_db
-from app.models import Approval, Branch, Device, Expense, Notification, Product, PurchaseOrder, PurchaseOrderLine, PurchaseReceipt, Sale, StockMovement, Supplier, Transfer, User, UserRole
+from app.models import Approval, Branch, Category, Device, Expense, Notification, Product, PurchaseOrder, PurchaseOrderLine, PurchaseReceipt, Sale, StockMovement, Supplier, Transfer, User, UserRole
 from app.seed import seed_database
+
+# Sentinel for mixin-backed rows written by a plain HTTP request rather than
+# replayed from a device's offline outbox (real per-write device attribution
+# arrives with the Phase 3 sync plumbing).
+SERVER_DEVICE_ID = "server"
 
 settings = get_settings()
 
@@ -51,6 +56,15 @@ class TransferIn(BaseModel):
     to_branch_id: str
     quantity: int = Field(gt=0)
     client_request_id: str | None = None
+
+
+class CategoryIn(BaseModel):
+    name: str
+    parent_id: str | None = None
+
+
+class ProductCategoryIn(BaseModel):
+    category_id: str | None = None
 
 class SaleIn(BaseModel):
     product_id: str
@@ -144,7 +158,7 @@ def bootstrap(
     products = db.scalars(select(Product).order_by(Product.name)).all()
     branches = db.scalars(select(Branch).order_by(Branch.kind)).all()
     movements = db.scalars(select(StockMovement).order_by(StockMovement.created_at.desc())).all()
-    return {"users": [serialize(u) for u in db.scalars(select(User)).all()], "products": [serialize(p) for p in products], "branches": [serialize(b) for b in branches], "suppliers": [serialize(s) for s in db.scalars(select(Supplier)).all()], "movements": [serialize(m) for m in movements], "transfers": [serialize(t) for t in db.scalars(select(Transfer).order_by(Transfer.requested_at.desc())).all()], "sales": [serialize(s) for s in db.scalars(select(Sale).order_by(Sale.created_at.desc())).all()], "purchase_orders": [serialize(o) for o in db.scalars(select(PurchaseOrder).order_by(PurchaseOrder.requested_at.desc())).all()], "purchase_order_lines": [serialize(l) for l in db.scalars(select(PurchaseOrderLine).order_by(PurchaseOrderLine.created_at.desc())).all()], "approvals": [serialize(a) for a in db.scalars(select(Approval).order_by(Approval.created_at.desc())).all()], "expenses": [serialize(e) for e in db.scalars(select(Expense).order_by(Expense.created_at.desc())).all()], "notifications": [serialize(n) for n in db.scalars(select(Notification).order_by(Notification.created_at.desc())).all()]}
+    return {"users": [serialize(u) for u in db.scalars(select(User)).all()], "products": [serialize(p) for p in products], "categories": [serialize(c) for c in db.scalars(select(Category).order_by(Category.name)).all()], "branches": [serialize(b) for b in branches], "suppliers": [serialize(s) for s in db.scalars(select(Supplier)).all()], "movements": [serialize(m) for m in movements], "transfers": [serialize(t) for t in db.scalars(select(Transfer).order_by(Transfer.created_at.desc())).all()], "sales": [serialize(s) for s in db.scalars(select(Sale).order_by(Sale.created_at.desc())).all()], "purchase_orders": [serialize(o) for o in db.scalars(select(PurchaseOrder).order_by(PurchaseOrder.requested_at.desc())).all()], "purchase_order_lines": [serialize(l) for l in db.scalars(select(PurchaseOrderLine).order_by(PurchaseOrderLine.created_at.desc())).all()], "approvals": [serialize(a) for a in db.scalars(select(Approval).order_by(Approval.created_at.desc())).all()], "expenses": [serialize(e) for e in db.scalars(select(Expense).order_by(Expense.created_at.desc())).all()], "notifications": [serialize(n) for n in db.scalars(select(Notification).order_by(Notification.created_at.desc())).all()]}
 
 @app.post("/api/v1/auth/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)) -> dict:
@@ -344,20 +358,125 @@ def receive_purchase_order(
 def create_transfer(
     payload: TransferIn,
     db: Session = Depends(get_db),
-    _: Annotated[User, Depends(require_roles(*CAN_REQUEST_TRANSFER))] = None,
+    current_user: Annotated[User, Depends(require_roles(*CAN_REQUEST_TRANSFER))] = None,
 ) -> dict:
     if payload.client_request_id:
         existing = db.scalar(select(Transfer).where(Transfer.idempotency_key == payload.client_request_id))
-        if existing: return {"reference": existing.reference, "message": "Transfer already posted"}
+        if existing: return {"id": existing.id, "reference": existing.reference, "status": existing.status, "message": "Transfer already requested"}
     require(db, Product, payload.product_id); require(db, Branch, payload.from_branch_id); require(db, Branch, payload.to_branch_id)
     if payload.from_branch_id == payload.to_branch_id: raise HTTPException(422, "Origin and destination must differ")
     if branch_stock(db, payload.product_id, payload.from_branch_id) < payload.quantity: raise HTTPException(422, "Insufficient origin stock")
     ref = reference("TRF")
-    transfer = Transfer(reference=ref, product_id=payload.product_id, from_branch_id=payload.from_branch_id, to_branch_id=payload.to_branch_id, quantity=payload.quantity, idempotency_key=payload.client_request_id, status="received", received_at=datetime.now(timezone.utc))
+    transfer = Transfer(reference=ref, product_id=payload.product_id, from_branch_id=payload.from_branch_id, to_branch_id=payload.to_branch_id, quantity=payload.quantity, idempotency_key=payload.client_request_id, status="requested", device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)
     db.add(transfer)
-    db.add_all([StockMovement(product_id=payload.product_id, branch_id=payload.from_branch_id, quantity=-payload.quantity, kind="transfer_out", reference=ref, created_by="Warehouse keeper"), StockMovement(product_id=payload.product_id, branch_id=payload.to_branch_id, quantity=payload.quantity, kind="transfer_in", reference=ref, created_by="Shop manager")])
-    db.add(Notification(title="Transfer received", body=f"{ref} is available at the destination branch.", kind="transfer")); db.commit()
-    return {"reference": ref, "message": "Transfer posted with matched ledger events"}
+    db.add(Notification(title="Transfer requested", body=f"{ref} awaits fulfilment from the source branch.", kind="transfer"))
+    db.commit()
+    return {"id": transfer.id, "reference": ref, "status": transfer.status, "message": "Transfer requested"}
+
+
+@app.get("/api/v1/transfers")
+def list_transfers(
+    status_query: str | None = Query(default=None, alias="status"),
+    branch_id: str | None = None,
+    db: Session = Depends(get_db),
+    _: Annotated[User, Depends(get_current_user)] = None,
+) -> list[dict]:
+    query = select(Transfer)
+    if status_query:
+        query = query.where(Transfer.status == status_query)
+    if branch_id:
+        query = query.where((Transfer.from_branch_id == branch_id) | (Transfer.to_branch_id == branch_id))
+    transfers = db.scalars(query.order_by(Transfer.created_at.desc())).all()
+    return [serialize(t) for t in transfers]
+
+
+@app.post("/api/v1/transfers/{transfer_id}/fulfil", status_code=201)
+def fulfil_transfer(
+    transfer_id: str,
+    db: Session = Depends(get_db),
+    current_user: Annotated[User, Depends(require_roles(*CAN_FULFIL_TRANSFER))] = None,
+) -> dict:
+    transfer = require(db, Transfer, transfer_id)
+    if transfer.status != "requested":
+        raise HTTPException(422, f"Transfer is {transfer.status}, expected requested")
+    if branch_stock(db, transfer.product_id, transfer.from_branch_id) < transfer.quantity:
+        raise HTTPException(422, "Insufficient origin stock")
+    db.add(StockMovement(product_id=transfer.product_id, branch_id=transfer.from_branch_id, quantity=-transfer.quantity, kind="transfer_out", reference=transfer.reference, created_by=current_user.full_name))
+    transfer.status = "in_transit"
+    transfer.fulfilled_by_id = current_user.id
+    transfer.fulfilled_at = datetime.now(timezone.utc)
+    db.add(Notification(title="Transfer in transit", body=f"{transfer.reference} left the source branch.", kind="transfer"))
+    db.commit()
+    return {"reference": transfer.reference, "status": transfer.status, "message": "Transfer fulfilled"}
+
+
+@app.post("/api/v1/transfers/{transfer_id}/receive", status_code=201)
+def receive_transfer(
+    transfer_id: str,
+    db: Session = Depends(get_db),
+    current_user: Annotated[User, Depends(require_roles(*CAN_RECEIVE_TRANSFER))] = None,
+) -> dict:
+    transfer = require(db, Transfer, transfer_id)
+    if transfer.status != "in_transit":
+        raise HTTPException(422, f"Transfer is {transfer.status}, expected in_transit")
+    db.add(StockMovement(product_id=transfer.product_id, branch_id=transfer.to_branch_id, quantity=transfer.quantity, kind="transfer_in", reference=transfer.reference, created_by=current_user.full_name))
+    transfer.status = "received"
+    transfer.received_by_id = current_user.id
+    transfer.received_at = datetime.now(timezone.utc)
+    db.add(Notification(title="Transfer received", body=f"{transfer.reference} is available at the destination branch.", kind="transfer"))
+    db.commit()
+    return {"reference": transfer.reference, "status": transfer.status, "message": "Transfer received"}
+
+
+@app.post("/api/v1/transfers/{transfer_id}/cancel")
+def cancel_transfer(
+    transfer_id: str,
+    db: Session = Depends(get_db),
+    _: Annotated[User, Depends(require_roles(*CAN_REQUEST_TRANSFER))] = None,
+) -> dict:
+    transfer = require(db, Transfer, transfer_id)
+    if transfer.status != "requested":
+        raise HTTPException(422, "Only a requested transfer can be cancelled before fulfilment")
+    transfer.status = "cancelled"
+    db.commit()
+    return {"reference": transfer.reference, "status": transfer.status, "message": "Transfer cancelled"}
+
+
+@app.get("/api/v1/categories")
+def list_categories(
+    db: Session = Depends(get_db),
+    _: Annotated[User, Depends(get_current_user)] = None,
+) -> list[dict]:
+    return [serialize(category) for category in db.scalars(select(Category).order_by(Category.name)).all()]
+
+
+@app.post("/api/v1/categories", status_code=201)
+def create_category(
+    payload: CategoryIn,
+    db: Session = Depends(get_db),
+    current_user: Annotated[User, Depends(require_roles(*CAN_MANAGE_STOCK_RECEIPTS))] = None,
+) -> dict:
+    if payload.parent_id:
+        require(db, Category, payload.parent_id)
+    category = Category(name=payload.name, parent_id=payload.parent_id, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)
+    db.add(category)
+    db.commit()
+    return serialize(category)
+
+
+@app.patch("/api/v1/products/{product_id}/category")
+def assign_product_category(
+    product_id: str,
+    payload: ProductCategoryIn,
+    db: Session = Depends(get_db),
+    _: Annotated[User, Depends(require_roles(*CAN_MANAGE_STOCK_RECEIPTS))] = None,
+) -> dict:
+    product = require(db, Product, product_id)
+    if payload.category_id:
+        require(db, Category, payload.category_id)
+    product.category_id = payload.category_id
+    db.commit()
+    return serialize(product)
 
 @app.post("/api/v1/sales", status_code=201)
 def create_sale(
