@@ -25,7 +25,7 @@ def seed_database(db: Session) -> None:
     db.add_all([Product(**row, device_id="system-import", created_by_id=owner_id) for row in data["products"]])
     db.flush()
     for row in data["receipts"]:
-        receipt = PurchaseReceipt(**row)
+        receipt = PurchaseReceipt(**row, device_id="system-import", created_by_id=owner_id)
         db.add(receipt)
-        db.add(StockMovement(product_id=row["product_id"], branch_id=row["branch_id"], quantity=row["quantity"], kind="receipt", reference=row["reference"], created_by="System import"))
+        db.add(StockMovement(product_id=row["product_id"], branch_id=row["branch_id"], quantity=row["quantity"], kind="receipt", reference=row["reference"], created_by="System import", device_id="system-import", created_by_id=owner_id))
     db.commit()

@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from app.core.auth import create_access_token, create_refresh_token, get_current_user, hash_password, require_roles, revoke_refresh_token, rotate_refresh_token, verify_and_upgrade_password
 from app.core.config import get_settings
 from app.core.permissions import CAN_APPROVE, CAN_FULFIL_TRANSFER, CAN_MANAGE_STOCK_RECEIPTS, CAN_MANAGE_USERS, CAN_RECEIVE_TRANSFER, CAN_RECORD_SALE, CAN_REQUEST_TRANSFER
-from app.db.base import Base
+from app.db.base import Base, SyncStatus
 from app.db.session import engine, get_db
 from app.models import Approval, Branch, Category, Device, Expense, Notification, Product, PurchaseOrder, PurchaseOrderLine, PurchaseReceipt, Sale, StockMovement, Supplier, Transfer, User, UserRole
 from app.seed import seed_database
@@ -78,6 +78,7 @@ class ApprovalIn(BaseModel):
     requester: str
     approver: str
     priority: str = "normal"
+    client_request_id: str | None = None
 
 
 class PurchaseOrderLineIn(BaseModel):
@@ -91,6 +92,7 @@ class PurchaseOrderIn(BaseModel):
     branch_id: str
     notes: str = ""
     items: list[PurchaseOrderLineIn] = Field(default_factory=list)
+    client_request_id: str | None = None
 
 
 class ExpenseIn(BaseModel):
@@ -98,6 +100,11 @@ class ExpenseIn(BaseModel):
     category: str
     amount: float = Field(gt=0)
     description: str
+    client_request_id: str | None = None
+
+
+class VersionedActionIn(BaseModel):
+    expected_version: int
 
 class LoginIn(BaseModel):
     email: str
@@ -280,15 +287,15 @@ def create_branch(
 def create_receipt(
     payload: ReceiptIn,
     db: Session = Depends(get_db),
-    _: Annotated[User, Depends(require_roles(*CAN_MANAGE_STOCK_RECEIPTS))] = None,
+    current_user: Annotated[User, Depends(require_roles(*CAN_MANAGE_STOCK_RECEIPTS))] = None,
 ) -> dict:
     if payload.client_request_id:
         existing = db.scalar(select(PurchaseReceipt).where(PurchaseReceipt.idempotency_key == payload.client_request_id))
         if existing: return {"reference": existing.reference, "message": "Goods receipt already posted"}
     require(db, Product, payload.product_id); require(db, Branch, payload.branch_id); require(db, Supplier, payload.supplier_id)
     ref = reference("GRN")
-    receipt = PurchaseReceipt(reference=ref, product_id=payload.product_id, branch_id=payload.branch_id, supplier_id=payload.supplier_id, quantity=payload.quantity, idempotency_key=payload.client_request_id)
-    db.add(receipt); db.add(StockMovement(product_id=payload.product_id, branch_id=payload.branch_id, quantity=payload.quantity, kind="receipt", reference=ref, created_by="Store keeper")); db.commit()
+    receipt = PurchaseReceipt(reference=ref, product_id=payload.product_id, branch_id=payload.branch_id, supplier_id=payload.supplier_id, quantity=payload.quantity, idempotency_key=payload.client_request_id, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)
+    db.add(receipt); db.add(StockMovement(product_id=payload.product_id, branch_id=payload.branch_id, quantity=payload.quantity, kind="receipt", reference=ref, created_by=current_user.full_name, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)); db.commit()
     return {"reference": ref, "message": "Goods receipt posted"}
 
 @app.post("/api/v1/purchase-orders", status_code=201)
@@ -297,6 +304,9 @@ def create_purchase_order(
     db: Session = Depends(get_db),
     current_user: Annotated[User, Depends(require_roles(*CAN_MANAGE_STOCK_RECEIPTS))] = None,
 ) -> dict:
+    if payload.client_request_id:
+        existing = db.scalar(select(PurchaseOrder).where(PurchaseOrder.idempotency_key == payload.client_request_id))
+        if existing: return {"id": existing.id, "reference": existing.reference, "status": existing.status, "version": existing.version, "message": "Purchase order already requested"}
     if not payload.items:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "At least one item is required")
     require(db, Supplier, payload.supplier_id)
@@ -305,16 +315,16 @@ def create_purchase_order(
         require(db, Product, item.product_id)
 
     order_reference = reference("PO")
-    order = PurchaseOrder(reference=order_reference, supplier_id=payload.supplier_id, branch_id=payload.branch_id, notes=payload.notes, created_by=current_user.full_name)
+    order = PurchaseOrder(reference=order_reference, supplier_id=payload.supplier_id, branch_id=payload.branch_id, notes=payload.notes, created_by=current_user.full_name, idempotency_key=payload.client_request_id, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)
     db.add(order)
     db.flush()
     db.add_all([
-        PurchaseOrderLine(purchase_order_id=order.id, product_id=item.product_id, quantity=item.quantity, unit_cost=item.unit_cost)
+        PurchaseOrderLine(purchase_order_id=order.id, product_id=item.product_id, quantity=item.quantity, unit_cost=item.unit_cost, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)
         for item in payload.items
     ])
     db.add(Notification(title="Purchase order requested", body=f"{order_reference} was created for {len(payload.items)} items.", kind="purchase_order"))
     db.commit()
-    return {"id": order.id, "reference": order_reference, "status": order.status, "message": "Purchase order requested"}
+    return {"id": order.id, "reference": order_reference, "status": order.status, "version": order.version, "message": "Purchase order requested"}
 
 
 @app.get("/api/v1/purchase-orders")
@@ -329,12 +339,17 @@ def list_purchase_orders(
 @app.post("/api/v1/purchase-orders/{purchase_order_id}/receive", status_code=201)
 def receive_purchase_order(
     purchase_order_id: str,
+    payload: VersionedActionIn,
     db: Session = Depends(get_db),
-    _: Annotated[User, Depends(require_roles(*CAN_MANAGE_STOCK_RECEIPTS))] = None,
+    current_user: Annotated[User, Depends(require_roles(*CAN_MANAGE_STOCK_RECEIPTS))] = None,
 ) -> dict:
     order = require(db, PurchaseOrder, purchase_order_id)
     if order.status == "received":
         return {"reference": order.reference, "message": "Purchase order already received"}
+    if order.version != payload.expected_version:
+        order.sync_status = SyncStatus.CONFLICT
+        db.commit()
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Purchase order changed since it was loaded (expected version {payload.expected_version}, currently {order.version})")
 
     lines = db.scalars(select(PurchaseOrderLine).where(PurchaseOrderLine.purchase_order_id == purchase_order_id)).all()
     if not lines:
@@ -344,14 +359,14 @@ def receive_purchase_order(
         require(db, Product, line.product_id)
         require(db, Branch, order.branch_id)
         receipt_reference = reference("GRN")
-        db.add(PurchaseReceipt(reference=receipt_reference, supplier_id=order.supplier_id, branch_id=order.branch_id, product_id=line.product_id, quantity=line.quantity, idempotency_key=None))
-        db.add(StockMovement(product_id=line.product_id, branch_id=order.branch_id, quantity=line.quantity, kind="receipt", reference=receipt_reference, created_by="Store keeper"))
+        db.add(PurchaseReceipt(reference=receipt_reference, supplier_id=order.supplier_id, branch_id=order.branch_id, product_id=line.product_id, quantity=line.quantity, idempotency_key=None, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id))
+        db.add(StockMovement(product_id=line.product_id, branch_id=order.branch_id, quantity=line.quantity, kind="receipt", reference=receipt_reference, created_by=current_user.full_name, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id))
 
     order.status = "received"
     order.received_at = datetime.now(timezone.utc)
     db.add(Notification(title="Goods received", body=f"{order.reference} completed and posted to stock.", kind="purchase_order"))
     db.commit()
-    return {"reference": order.reference, "received_lines": len(lines), "message": "Purchase order received"}
+    return {"reference": order.reference, "received_lines": len(lines), "version": order.version, "message": "Purchase order received"}
 
 
 @app.post("/api/v1/transfers", status_code=201)
@@ -362,7 +377,7 @@ def create_transfer(
 ) -> dict:
     if payload.client_request_id:
         existing = db.scalar(select(Transfer).where(Transfer.idempotency_key == payload.client_request_id))
-        if existing: return {"id": existing.id, "reference": existing.reference, "status": existing.status, "message": "Transfer already requested"}
+        if existing: return {"id": existing.id, "reference": existing.reference, "status": existing.status, "version": existing.version, "message": "Transfer already requested"}
     require(db, Product, payload.product_id); require(db, Branch, payload.from_branch_id); require(db, Branch, payload.to_branch_id)
     if payload.from_branch_id == payload.to_branch_id: raise HTTPException(422, "Origin and destination must differ")
     if branch_stock(db, payload.product_id, payload.from_branch_id) < payload.quantity: raise HTTPException(422, "Insufficient origin stock")
@@ -371,7 +386,7 @@ def create_transfer(
     db.add(transfer)
     db.add(Notification(title="Transfer requested", body=f"{ref} awaits fulfilment from the source branch.", kind="transfer"))
     db.commit()
-    return {"id": transfer.id, "reference": ref, "status": transfer.status, "message": "Transfer requested"}
+    return {"id": transfer.id, "reference": ref, "status": transfer.status, "version": transfer.version, "message": "Transfer requested"}
 
 
 @app.get("/api/v1/transfers")
@@ -393,39 +408,49 @@ def list_transfers(
 @app.post("/api/v1/transfers/{transfer_id}/fulfil", status_code=201)
 def fulfil_transfer(
     transfer_id: str,
+    payload: VersionedActionIn,
     db: Session = Depends(get_db),
     current_user: Annotated[User, Depends(require_roles(*CAN_FULFIL_TRANSFER))] = None,
 ) -> dict:
     transfer = require(db, Transfer, transfer_id)
+    if transfer.version != payload.expected_version:
+        transfer.sync_status = SyncStatus.CONFLICT
+        db.commit()
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Transfer changed since it was loaded (expected version {payload.expected_version}, currently {transfer.version})")
     if transfer.status != "requested":
         raise HTTPException(422, f"Transfer is {transfer.status}, expected requested")
     if branch_stock(db, transfer.product_id, transfer.from_branch_id) < transfer.quantity:
         raise HTTPException(422, "Insufficient origin stock")
-    db.add(StockMovement(product_id=transfer.product_id, branch_id=transfer.from_branch_id, quantity=-transfer.quantity, kind="transfer_out", reference=transfer.reference, created_by=current_user.full_name))
+    db.add(StockMovement(product_id=transfer.product_id, branch_id=transfer.from_branch_id, quantity=-transfer.quantity, kind="transfer_out", reference=transfer.reference, created_by=current_user.full_name, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id))
     transfer.status = "in_transit"
     transfer.fulfilled_by_id = current_user.id
     transfer.fulfilled_at = datetime.now(timezone.utc)
     db.add(Notification(title="Transfer in transit", body=f"{transfer.reference} left the source branch.", kind="transfer"))
     db.commit()
-    return {"reference": transfer.reference, "status": transfer.status, "message": "Transfer fulfilled"}
+    return {"reference": transfer.reference, "status": transfer.status, "version": transfer.version, "message": "Transfer fulfilled"}
 
 
 @app.post("/api/v1/transfers/{transfer_id}/receive", status_code=201)
 def receive_transfer(
     transfer_id: str,
+    payload: VersionedActionIn,
     db: Session = Depends(get_db),
     current_user: Annotated[User, Depends(require_roles(*CAN_RECEIVE_TRANSFER))] = None,
 ) -> dict:
     transfer = require(db, Transfer, transfer_id)
+    if transfer.version != payload.expected_version:
+        transfer.sync_status = SyncStatus.CONFLICT
+        db.commit()
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Transfer changed since it was loaded (expected version {payload.expected_version}, currently {transfer.version})")
     if transfer.status != "in_transit":
         raise HTTPException(422, f"Transfer is {transfer.status}, expected in_transit")
-    db.add(StockMovement(product_id=transfer.product_id, branch_id=transfer.to_branch_id, quantity=transfer.quantity, kind="transfer_in", reference=transfer.reference, created_by=current_user.full_name))
+    db.add(StockMovement(product_id=transfer.product_id, branch_id=transfer.to_branch_id, quantity=transfer.quantity, kind="transfer_in", reference=transfer.reference, created_by=current_user.full_name, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id))
     transfer.status = "received"
     transfer.received_by_id = current_user.id
     transfer.received_at = datetime.now(timezone.utc)
     db.add(Notification(title="Transfer received", body=f"{transfer.reference} is available at the destination branch.", kind="transfer"))
     db.commit()
-    return {"reference": transfer.reference, "status": transfer.status, "message": "Transfer received"}
+    return {"reference": transfer.reference, "status": transfer.status, "version": transfer.version, "message": "Transfer received"}
 
 
 @app.post("/api/v1/transfers/{transfer_id}/cancel")
@@ -482,7 +507,7 @@ def assign_product_category(
 def create_sale(
     payload: SaleIn,
     db: Session = Depends(get_db),
-    _: Annotated[User, Depends(require_roles(*CAN_RECORD_SALE))] = None,
+    current_user: Annotated[User, Depends(require_roles(*CAN_RECORD_SALE))] = None,
 ) -> dict:
     if payload.client_request_id:
         existing = db.scalar(select(Sale).where(Sale.idempotency_key == payload.client_request_id))
@@ -491,7 +516,7 @@ def create_sale(
     if branch_stock(db, payload.product_id, payload.branch_id) < payload.quantity: raise HTTPException(422, "Insufficient branch stock")
     ref = reference("S")
     total = product.selling_price * payload.quantity
-    db.add(Sale(receipt_number=ref, product_id=payload.product_id, branch_id=payload.branch_id, quantity=payload.quantity, total=total, idempotency_key=payload.client_request_id)); db.add(StockMovement(product_id=payload.product_id, branch_id=payload.branch_id, quantity=-payload.quantity, kind="sale", reference=ref, created_by="Cashier")); db.commit()
+    db.add(Sale(receipt_number=ref, product_id=payload.product_id, branch_id=payload.branch_id, quantity=payload.quantity, total=total, idempotency_key=payload.client_request_id)); db.add(StockMovement(product_id=payload.product_id, branch_id=payload.branch_id, quantity=-payload.quantity, kind="sale", reference=ref, created_by=current_user.full_name, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)); db.commit()
     return {"receipt_number": ref, "total": total, "message": "Sale recorded"}
 
 @app.get("/api/v1/approvals")
@@ -509,7 +534,12 @@ def create_approval(
     db: Session = Depends(get_db),
     _: Annotated[User, Depends(require_roles(*CAN_APPROVE))] = None,
 ) -> dict:
-    approval = Approval(**payload.model_dump()); db.add(approval); db.add(Notification(title="Approval requested", body=payload.subject, kind="approval")); db.commit(); return serialize(approval)
+    if payload.client_request_id:
+        existing = db.scalar(select(Approval).where(Approval.idempotency_key == payload.client_request_id))
+        if existing: return serialize(existing)
+    fields = payload.model_dump(exclude={"client_request_id"})
+    approval = Approval(**fields, idempotency_key=payload.client_request_id)
+    db.add(approval); db.add(Notification(title="Approval requested", body=payload.subject, kind="approval")); db.commit(); return serialize(approval)
 
 
 @app.post("/api/v1/approvals/{approval_id}/approve")
@@ -536,7 +566,13 @@ def create_expense(
     db: Session = Depends(get_db),
     _: Annotated[User, Depends(require_roles(*CAN_APPROVE))] = None,
 ) -> dict:
-    require(db, Branch, payload.branch_id); expense = Expense(**payload.model_dump()); db.add(expense); db.add(Notification(title="Expense awaiting approval", body=payload.description, kind="expense")); db.commit(); return serialize(expense)
+    if payload.client_request_id:
+        existing = db.scalar(select(Expense).where(Expense.idempotency_key == payload.client_request_id))
+        if existing: return serialize(existing)
+    require(db, Branch, payload.branch_id)
+    fields = payload.model_dump(exclude={"client_request_id"})
+    expense = Expense(**fields, idempotency_key=payload.client_request_id)
+    db.add(expense); db.add(Notification(title="Expense awaiting approval", body=payload.description, kind="expense")); db.commit(); return serialize(expense)
 
 
 @app.get("/api/v1/notifications")

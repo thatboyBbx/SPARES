@@ -67,6 +67,14 @@ def _request_transfer(headers: dict[str, str], quantity: int = 2) -> dict:
     return response.json()
 
 
+def _fulfil(headers: dict[str, str], transfer: dict):
+    return client.post(f"/api/v1/transfers/{transfer['id']}/fulfil", headers=headers, json={"expected_version": transfer["version"]})
+
+
+def _receive(headers: dict[str, str], transfer: dict):
+    return client.post(f"/api/v1/transfers/{transfer['id']}/receive", headers=headers, json={"expected_version": transfer["version"]})
+
+
 def test_full_request_fulfil_receive_flow() -> None:
     _top_up_stock()
     store_keeper = _login("warehouse@sparepilot.local")
@@ -76,11 +84,12 @@ def test_full_request_fulfil_receive_flow() -> None:
     assert created["status"] == "requested"
     transfer_id = created["id"]
 
-    fulfil_response = client.post(f"/api/v1/transfers/{transfer_id}/fulfil", headers=store_keeper)
+    fulfil_response = _fulfil(store_keeper, created)
     assert fulfil_response.status_code == 201
-    assert fulfil_response.json()["status"] == "in_transit"
+    fulfilled = fulfil_response.json()
+    assert fulfilled["status"] == "in_transit"
 
-    receive_response = client.post(f"/api/v1/transfers/{transfer_id}/receive", headers=shop_manager)
+    receive_response = _receive(shop_manager, {"id": transfer_id, "version": fulfilled["version"]})
     assert receive_response.status_code == 201
     assert receive_response.json()["status"] == "received"
 
@@ -99,10 +108,10 @@ def test_fulfil_rejects_stock_depleted_by_another_transfer_since_request() -> No
     first = _request_transfer(store_keeper, quantity=available)
     second = _request_transfer(store_keeper, quantity=available)
 
-    first_fulfil = client.post(f"/api/v1/transfers/{first['id']}/fulfil", headers=store_keeper)
+    first_fulfil = _fulfil(store_keeper, first)
     assert first_fulfil.status_code == 201
 
-    second_fulfil = client.post(f"/api/v1/transfers/{second['id']}/fulfil", headers=store_keeper)
+    second_fulfil = _fulfil(store_keeper, second)
     assert second_fulfil.status_code == 422
 
     # This test intentionally drains the branch to zero; restore headroom for
@@ -117,7 +126,7 @@ def test_receive_before_fulfil_is_rejected() -> None:
     created = _request_transfer(store_keeper)
     transfer_id = created["id"]
 
-    response = client.post(f"/api/v1/transfers/{transfer_id}/receive", headers=shop_manager)
+    response = _receive(shop_manager, created)
     assert response.status_code == 422
 
 
@@ -137,7 +146,7 @@ def test_shop_manager_cannot_fulfil_transfer() -> None:
     shop_manager = _login("shop@sparepilot.local")
     created = _request_transfer(store_keeper)
 
-    response = client.post(f"/api/v1/transfers/{created['id']}/fulfil", headers=shop_manager)
+    response = _fulfil(shop_manager, created)
     assert response.status_code == 403
 
 
@@ -152,7 +161,7 @@ def test_cancel_only_allowed_before_fulfilment() -> None:
     assert cancel_response.json()["status"] == "cancelled"
 
     second_request = _request_transfer(store_keeper)
-    fulfil_response = client.post(f"/api/v1/transfers/{second_request['id']}/fulfil", headers=store_keeper)
+    fulfil_response = _fulfil(store_keeper, second_request)
     assert fulfil_response.status_code == 201
 
     late_cancel = client.post(f"/api/v1/transfers/{second_request['id']}/cancel", headers=store_keeper)

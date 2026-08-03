@@ -48,25 +48,25 @@ class Product(SyncedEntityMixin, Base):
     category_id: Mapped[str | None] = mapped_column(ForeignKey("categories.id"), nullable=True, index=True)
 
 
-class StockMovement(Base):
+class StockMovement(SyncedEntityMixin, Base):
     __tablename__ = "stock_movements"
     # Real-time SUM() over the ledger is used for balances rather than a
     # materialized quantity column, to keep the ledger the single source of
     # truth; this composite index keeps that aggregation cheap per branch.
     __table_args__ = (Index("ix_stock_movements_product_branch", "product_id", "branch_id"),)
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     product_id: Mapped[str] = mapped_column(ForeignKey("products.id"), index=True)
     branch_id: Mapped[str] = mapped_column(ForeignKey("branches.id"), index=True)
     quantity: Mapped[int] = mapped_column(Integer)
     kind: Mapped[str] = mapped_column(String(30))  # receipt, sale, transfer_out, transfer_in, adjustment
     reference: Mapped[str] = mapped_column(String(80), index=True)
     created_by: Mapped[str] = mapped_column(String(120))
+    # Overrides the mixin's plain created_at to keep the index the ledger's
+    # time-ordered reads (bootstrap, reports) already rely on.
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
-class PurchaseReceipt(Base):
+class PurchaseReceipt(SyncedEntityMixin, Base):
     __tablename__ = "purchase_receipts"
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     reference: Mapped[str] = mapped_column(String(80), unique=True)
     supplier_id: Mapped[str] = mapped_column(ForeignKey("suppliers.id"))
     branch_id: Mapped[str] = mapped_column(ForeignKey("branches.id"))
@@ -76,27 +76,25 @@ class PurchaseReceipt(Base):
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
-class PurchaseOrder(Base):
+class PurchaseOrder(SyncedEntityMixin, Base):
     __tablename__ = "purchase_orders"
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     reference: Mapped[str] = mapped_column(String(80), unique=True)
     supplier_id: Mapped[str] = mapped_column(ForeignKey("suppliers.id"), index=True)
     branch_id: Mapped[str] = mapped_column(ForeignKey("branches.id"), index=True)
     status: Mapped[str] = mapped_column(String(30), default="pending")
     notes: Mapped[str] = mapped_column(Text, default="")
     created_by: Mapped[str] = mapped_column(String(120), default="System")
+    idempotency_key: Mapped[str | None] = mapped_column(String(80), unique=True, nullable=True)
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class PurchaseOrderLine(Base):
+class PurchaseOrderLine(SyncedEntityMixin, Base):
     __tablename__ = "purchase_order_lines"
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     purchase_order_id: Mapped[str] = mapped_column(ForeignKey("purchase_orders.id"), index=True)
     product_id: Mapped[str] = mapped_column(ForeignKey("products.id"), index=True)
     quantity: Mapped[int] = mapped_column(Integer)
     unit_cost: Mapped[float] = mapped_column(Float, default=0.0)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class Transfer(SyncedEntityMixin, Base):
@@ -138,6 +136,7 @@ class Approval(Base):
     approver: Mapped[str] = mapped_column(String(120))
     priority: Mapped[str] = mapped_column(String(20), default="normal")
     status: Mapped[str] = mapped_column(String(20), default="pending")
+    idempotency_key: Mapped[str | None] = mapped_column(String(80), unique=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -149,6 +148,7 @@ class Expense(Base):
     amount: Mapped[float] = mapped_column(Float)
     description: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(20), default="pending")
+    idempotency_key: Mapped[str | None] = mapped_column(String(80), unique=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

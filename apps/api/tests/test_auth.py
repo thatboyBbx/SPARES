@@ -119,7 +119,7 @@ def test_purchase_order_receiving_and_notifications_work() -> None:
     assert body["message"] == "Purchase order requested"
 
     purchase_order_id = body["id"]
-    receive_response = client.post(f"/api/v1/purchase-orders/{purchase_order_id}/receive", headers=headers)
+    receive_response = client.post(f"/api/v1/purchase-orders/{purchase_order_id}/receive", headers=headers, json={"expected_version": body["version"]})
     assert receive_response.status_code == 201
     assert receive_response.json()["message"] == "Purchase order received"
 
