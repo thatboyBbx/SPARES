@@ -1,6 +1,6 @@
 """Database-backed API for the SparePilot operating MVP."""
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 from uuid import uuid4
 
@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from app.core.auth import create_access_token, create_refresh_token, get_current_user, hash_password, require_roles, revoke_refresh_token, rotate_refresh_token, verify_and_upgrade_password
 from app.core.config import get_settings
 from app.core.permissions import CAN_APPROVE, CAN_FULFIL_TRANSFER, CAN_MANAGE_STOCK_RECEIPTS, CAN_MANAGE_USERS, CAN_RECEIVE_TRANSFER, CAN_RECORD_SALE, CAN_REQUEST_TRANSFER
-from app.db.base import Base, SyncStatus
+from app.db.base import Base, SyncStatus, as_aware_utc
 from app.db.session import engine, get_db
 from app.models import Approval, Branch, Category, Customer, Device, Expense, Notification, Product, PurchaseOrder, PurchaseOrderLine, PurchaseReceipt, Sale, StockMovement, Supplier, Transfer, User, UserRole
 from app.seed import seed_database
@@ -84,7 +84,12 @@ class ApprovalIn(BaseModel):
     requester: str
     approver: str
     priority: str = "normal"
+    deadline: datetime | None = None
     client_request_id: str | None = None
+
+
+class ProductPriceIn(BaseModel):
+    selling_price: float = Field(gt=0)
 
 
 class PurchaseOrderLineIn(BaseModel):
@@ -159,6 +164,92 @@ def require(db: Session, model: type, identity: str):
         raise HTTPException(404, f"{model.__name__} not found")
     return record
 
+# Entities an Approval can gate; approving/rejecting the Approval flips the
+# entity's own status through the same code path so the two can never drift
+# apart, regardless of whether the operator acts from the Approval side
+# (/approvals/{id}/approve) or the entity side (/expenses/{id}/approve).
+APPROVABLE_ENTITY_MODELS: dict[str, type] = {"expense": Expense, "purchase_order": PurchaseOrder}
+DEFAULT_APPROVAL_WINDOW = timedelta(hours=72)
+
+
+def default_deadline() -> datetime:
+    return datetime.now(timezone.utc) + DEFAULT_APPROVAL_WINDOW
+
+
+def create_linked_approval(
+    db: Session,
+    *,
+    type_: str,
+    subject: str,
+    requester: User,
+    approver_label: str = "",
+    related_entity_type: str | None = None,
+    related_entity_id: str | None = None,
+    priority: str = "normal",
+    deadline: datetime | None = None,
+) -> Approval:
+    approval = Approval(
+        type=type_,
+        subject=subject,
+        requester=requester.full_name,
+        approver=approver_label,
+        priority=priority,
+        related_entity_type=related_entity_type,
+        related_entity_id=related_entity_id,
+        deadline=deadline or default_deadline(),
+        device_id=SERVER_DEVICE_ID,
+        created_by_id=requester.id,
+    )
+    db.add(approval)
+    return approval
+
+
+def dispatch_approval_decision(db: Session, approval: Approval, decision: str, actor: User) -> None:
+    approval.status = decision
+    approval.approver_id = actor.id
+    if approval.related_entity_type and approval.related_entity_id:
+        model = APPROVABLE_ENTITY_MODELS.get(approval.related_entity_type)
+        entity = db.get(model, approval.related_entity_id) if model else None
+        if entity is not None:
+            entity.status = decision
+            if decision == "approved" and hasattr(entity, "approved_by_id"):
+                entity.approved_by_id = actor.id
+                entity.approved_at = datetime.now(timezone.utc)
+
+
+def find_linked_approval(db: Session, related_entity_type: str, related_entity_id: str) -> Approval:
+    approval = db.scalar(
+        select(Approval).where(
+            Approval.related_entity_type == related_entity_type,
+            Approval.related_entity_id == related_entity_id,
+            Approval.status == "pending",
+        )
+    )
+    if not approval:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No pending approval linked to this record")
+    return approval
+
+
+def escalate_overdue_approvals(db: Session) -> None:
+    """Lazy escalation: bump overdue pending approvals to high priority
+    whenever an approval endpoint is touched, rather than running a
+    background job for a table this size."""
+    now = datetime.now(timezone.utc)
+    overdue = db.scalars(
+        select(Approval).where(Approval.status == "pending", Approval.deadline.is_not(None), Approval.deadline < now, Approval.priority != "high")
+    ).all()
+    for approval in overdue:
+        approval.priority = "high"
+    if overdue:
+        db.commit()
+
+
+def serialize_approval(approval: Approval) -> dict:
+    result = serialize(approval)
+    result["is_overdue"] = bool(approval.deadline and approval.status == "pending" and as_aware_utc(approval.deadline) < datetime.now(timezone.utc))
+    return result
+
+
 @app.get("/health", tags=["system"])
 def health_check() -> dict[str, str]:
     return {"status": "ok", "environment": settings.environment}
@@ -171,7 +262,7 @@ def bootstrap(
     products = db.scalars(select(Product).order_by(Product.name)).all()
     branches = db.scalars(select(Branch).order_by(Branch.kind)).all()
     movements = db.scalars(select(StockMovement).order_by(StockMovement.created_at.desc())).all()
-    return {"users": [serialize(u) for u in db.scalars(select(User)).all()], "products": [serialize(p) for p in products], "categories": [serialize(c) for c in db.scalars(select(Category).order_by(Category.name)).all()], "branches": [serialize(b) for b in branches], "suppliers": [serialize(s) for s in db.scalars(select(Supplier)).all()], "customers": [serialize(c) for c in db.scalars(select(Customer).order_by(Customer.name)).all()], "movements": [serialize(m) for m in movements], "transfers": [serialize(t) for t in db.scalars(select(Transfer).order_by(Transfer.created_at.desc())).all()], "sales": [serialize(s) for s in db.scalars(select(Sale).order_by(Sale.created_at.desc())).all()], "purchase_orders": [serialize(o) for o in db.scalars(select(PurchaseOrder).order_by(PurchaseOrder.requested_at.desc())).all()], "purchase_order_lines": [serialize(l) for l in db.scalars(select(PurchaseOrderLine).order_by(PurchaseOrderLine.created_at.desc())).all()], "approvals": [serialize(a) for a in db.scalars(select(Approval).order_by(Approval.created_at.desc())).all()], "expenses": [serialize(e) for e in db.scalars(select(Expense).order_by(Expense.created_at.desc())).all()], "notifications": [serialize(n) for n in db.scalars(select(Notification).order_by(Notification.created_at.desc())).all()]}
+    return {"users": [serialize(u) for u in db.scalars(select(User)).all()], "products": [serialize(p) for p in products], "categories": [serialize(c) for c in db.scalars(select(Category).order_by(Category.name)).all()], "branches": [serialize(b) for b in branches], "suppliers": [serialize(s) for s in db.scalars(select(Supplier)).all()], "customers": [serialize(c) for c in db.scalars(select(Customer).order_by(Customer.name)).all()], "movements": [serialize(m) for m in movements], "transfers": [serialize(t) for t in db.scalars(select(Transfer).order_by(Transfer.created_at.desc())).all()], "sales": [serialize(s) for s in db.scalars(select(Sale).order_by(Sale.created_at.desc())).all()], "purchase_orders": [serialize(o) for o in db.scalars(select(PurchaseOrder).order_by(PurchaseOrder.requested_at.desc())).all()], "purchase_order_lines": [serialize(l) for l in db.scalars(select(PurchaseOrderLine).order_by(PurchaseOrderLine.created_at.desc())).all()], "approvals": [serialize_approval(a) for a in db.scalars(select(Approval).order_by(Approval.created_at.desc())).all()], "expenses": [serialize(e) for e in db.scalars(select(Expense).order_by(Expense.created_at.desc())).all()], "notifications": [serialize(n) for n in db.scalars(select(Notification).order_by(Notification.created_at.desc())).all()]}
 
 @app.post("/api/v1/auth/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)) -> dict:
@@ -328,6 +419,7 @@ def create_purchase_order(
         PurchaseOrderLine(purchase_order_id=order.id, product_id=item.product_id, quantity=item.quantity, unit_cost=item.unit_cost, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)
         for item in payload.items
     ])
+    create_linked_approval(db, type_="purchase_order", subject=f"Purchase order {order_reference} ({len(payload.items)} items)", requester=current_user, related_entity_type="purchase_order", related_entity_id=order.id)
     db.add(Notification(title="Purchase order requested", body=f"{order_reference} was created for {len(payload.items)} items.", kind="purchase_order"))
     db.commit()
     return {"id": order.id, "reference": order_reference, "status": order.status, "version": order.version, "message": "Purchase order requested"}
@@ -348,12 +440,12 @@ def approve_purchase_order(
     db: Session = Depends(get_db),
     current_user: Annotated[User, Depends(require_roles(*CAN_APPROVE))] = None,
 ) -> dict:
+    escalate_overdue_approvals(db)
     order = require(db, PurchaseOrder, purchase_order_id)
     if order.status != "requested":
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Purchase order is {order.status}, expected requested")
-    order.status = "approved"
-    order.approved_by_id = current_user.id
-    order.approved_at = datetime.now(timezone.utc)
+    approval = find_linked_approval(db, "purchase_order", order.id)
+    dispatch_approval_decision(db, approval, "approved", current_user)
     db.add(Notification(title="Purchase order approved", body=f"{order.reference} is approved and ready to receive.", kind="purchase_order"))
     db.commit()
     return {"reference": order.reference, "status": order.status, "version": order.version, "message": "Purchase order approved"}
@@ -532,6 +624,31 @@ def assign_product_category(
     db.commit()
     return serialize(product)
 
+
+@app.patch("/api/v1/products/{product_id}/price")
+def update_product_price(
+    product_id: str,
+    payload: ProductPriceIn,
+    db: Session = Depends(get_db),
+    current_user: Annotated[User, Depends(get_current_user)] = None,
+) -> dict:
+    product = require(db, Product, product_id)
+    if current_user.role in (UserRole.OWNER, UserRole.ACCOUNTANT, UserRole.SUPER_ADMIN):
+        product.selling_price = payload.selling_price
+        db.commit()
+        return {"product": serialize(product), "message": "Price updated"}
+    approval = create_linked_approval(
+        db,
+        type_="price_change",
+        subject=f"Change {product.name} selling price from {product.selling_price} to {payload.selling_price}",
+        requester=current_user,
+        related_entity_type="product",
+        related_entity_id=product.id,
+    )
+    db.add(Notification(title="Price change requested", body=approval.subject, kind="approval"))
+    db.commit()
+    return {"approval": serialize_approval(approval), "message": "Price change submitted for approval"}
+
 @app.post("/api/v1/sales", status_code=201)
 def create_sale(
     payload: SaleIn,
@@ -579,55 +696,96 @@ def list_approvals(
     db: Session = Depends(get_db),
     _: Annotated[User, Depends(get_current_user)] = None,
 ) -> list[dict]:
+    escalate_overdue_approvals(db)
     approvals = db.scalars(select(Approval).order_by(Approval.created_at.desc())).all()
-    return [serialize(approval) for approval in approvals]
+    return [serialize_approval(approval) for approval in approvals]
 
 
 @app.post("/api/v1/approvals", status_code=201)
 def create_approval(
     payload: ApprovalIn,
     db: Session = Depends(get_db),
-    _: Annotated[User, Depends(require_roles(*CAN_APPROVE))] = None,
+    current_user: Annotated[User, Depends(require_roles(*CAN_APPROVE))] = None,
 ) -> dict:
+    escalate_overdue_approvals(db)
     if payload.client_request_id:
         existing = db.scalar(select(Approval).where(Approval.idempotency_key == payload.client_request_id))
-        if existing: return serialize(existing)
-    fields = payload.model_dump(exclude={"client_request_id"})
-    approval = Approval(**fields, idempotency_key=payload.client_request_id)
-    db.add(approval); db.add(Notification(title="Approval requested", body=payload.subject, kind="approval")); db.commit(); return serialize(approval)
+        if existing: return serialize_approval(existing)
+    fields = payload.model_dump(exclude={"client_request_id", "deadline"})
+    approval = Approval(**fields, idempotency_key=payload.client_request_id, deadline=payload.deadline or default_deadline(), device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)
+    db.add(approval); db.add(Notification(title="Approval requested", body=payload.subject, kind="approval")); db.commit(); return serialize_approval(approval)
 
 
 @app.post("/api/v1/approvals/{approval_id}/approve")
 def approve(
     approval_id: str,
     db: Session = Depends(get_db),
-    _: Annotated[User, Depends(require_roles(*CAN_APPROVE))] = None,
+    current_user: Annotated[User, Depends(require_roles(*CAN_APPROVE))] = None,
 ) -> dict:
-    approval = require(db, Approval, approval_id); approval.status = "approved"; db.commit(); return serialize(approval)
+    escalate_overdue_approvals(db)
+    approval = require(db, Approval, approval_id)
+    dispatch_approval_decision(db, approval, "approved", current_user)
+    db.commit()
+    return serialize_approval(approval)
 
 
 @app.post("/api/v1/approvals/{approval_id}/reject")
 def reject_approval(
     approval_id: str,
     db: Session = Depends(get_db),
-    _: Annotated[User, Depends(require_roles(*CAN_APPROVE))] = None,
+    current_user: Annotated[User, Depends(require_roles(*CAN_APPROVE))] = None,
 ) -> dict:
-    approval = require(db, Approval, approval_id); approval.status = "rejected"; db.commit(); return serialize(approval)
+    escalate_overdue_approvals(db)
+    approval = require(db, Approval, approval_id)
+    dispatch_approval_decision(db, approval, "rejected", current_user)
+    db.commit()
+    return serialize_approval(approval)
 
 
 @app.post("/api/v1/expenses", status_code=201)
 def create_expense(
     payload: ExpenseIn,
     db: Session = Depends(get_db),
-    _: Annotated[User, Depends(require_roles(*CAN_APPROVE))] = None,
+    current_user: Annotated[User, Depends(require_roles(*CAN_APPROVE))] = None,
 ) -> dict:
     if payload.client_request_id:
         existing = db.scalar(select(Expense).where(Expense.idempotency_key == payload.client_request_id))
         if existing: return serialize(existing)
     require(db, Branch, payload.branch_id)
     fields = payload.model_dump(exclude={"client_request_id"})
-    expense = Expense(**fields, idempotency_key=payload.client_request_id)
-    db.add(expense); db.add(Notification(title="Expense awaiting approval", body=payload.description, kind="expense")); db.commit(); return serialize(expense)
+    expense = Expense(**fields, idempotency_key=payload.client_request_id, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)
+    db.add(expense)
+    db.flush()
+    create_linked_approval(db, type_="expense", subject=f"Expense: {payload.description}", requester=current_user, related_entity_type="expense", related_entity_id=expense.id)
+    db.add(Notification(title="Expense awaiting approval", body=payload.description, kind="expense")); db.commit(); return serialize(expense)
+
+
+@app.post("/api/v1/expenses/{expense_id}/approve")
+def approve_expense(
+    expense_id: str,
+    db: Session = Depends(get_db),
+    current_user: Annotated[User, Depends(require_roles(*CAN_APPROVE))] = None,
+) -> dict:
+    escalate_overdue_approvals(db)
+    expense = require(db, Expense, expense_id)
+    approval = find_linked_approval(db, "expense", expense_id)
+    dispatch_approval_decision(db, approval, "approved", current_user)
+    db.commit()
+    return serialize(expense)
+
+
+@app.post("/api/v1/expenses/{expense_id}/reject")
+def reject_expense(
+    expense_id: str,
+    db: Session = Depends(get_db),
+    current_user: Annotated[User, Depends(require_roles(*CAN_APPROVE))] = None,
+) -> dict:
+    escalate_overdue_approvals(db)
+    expense = require(db, Expense, expense_id)
+    approval = find_linked_approval(db, "expense", expense_id)
+    dispatch_approval_decision(db, approval, "rejected", current_user)
+    db.commit()
+    return serialize(expense)
 
 
 @app.get("/api/v1/notifications")

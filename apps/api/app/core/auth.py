@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.db.base import as_aware_utc
 from app.db.session import get_db
 from app.models import RefreshToken, User, UserRole
 
@@ -81,19 +82,12 @@ def create_refresh_token(db: Session, user_id: str, device_id: str | None = None
     return raw_token
 
 
-def _as_aware_utc(value: datetime) -> datetime:
-    """SQLite drops tzinfo on round-trip even for DateTime(timezone=True)
-    columns — every stored datetime here is UTC by convention, so a naive
-    value read back is always treated as UTC rather than the local zone."""
-    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-
-
 def rotate_refresh_token(db: Session, raw_token: str) -> tuple[str, str, User]:
     """Validate + revoke the presented refresh token and issue a new
     access/refresh pair. Raises 401 on any invalid/expired/revoked token."""
     token_hash = _hash_refresh_token(raw_token)
     record = db.scalar(select(RefreshToken).where(RefreshToken.token_hash == token_hash))
-    if not record or record.revoked_at is not None or _as_aware_utc(record.expires_at) < datetime.now(timezone.utc):
+    if not record or record.revoked_at is not None or as_aware_utc(record.expires_at) < datetime.now(timezone.utc):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired refresh token")
     user = db.get(User, record.user_id)
     if not user or not user.is_active:

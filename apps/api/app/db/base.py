@@ -52,6 +52,13 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def as_aware_utc(value: datetime) -> datetime:
+    """SQLite drops tzinfo on round-trip even for DateTime(timezone=True)
+    columns — every stored datetime here is UTC by convention, so a naive
+    value read back is always treated as UTC rather than the local zone."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
 class SyncedEntityMixin:
     """
     Mixin for any table whose rows can originate offline on a device and

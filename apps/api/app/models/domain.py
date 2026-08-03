@@ -135,9 +135,12 @@ class Sale(SyncedEntityMixin, Base):
     idempotency_key: Mapped[str | None] = mapped_column(String(80), unique=True, nullable=True)
 
 
-class Approval(Base):
+class Approval(SyncedEntityMixin, Base):
+    """`created_by_id` (from the mixin) is the requester; `approver_id` is
+    who resolved it. `related_entity_type`/`related_entity_id` link this
+    approval to the record it gates (e.g. an Expense or PurchaseOrder) so
+    dispatch_approval_decision() can flip both statuses together."""
     __tablename__ = "approvals"
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     type: Mapped[str] = mapped_column(String(50))
     subject: Mapped[str] = mapped_column(String(200))
     requester: Mapped[str] = mapped_column(String(120))
@@ -145,19 +148,20 @@ class Approval(Base):
     priority: Mapped[str] = mapped_column(String(20), default="normal")
     status: Mapped[str] = mapped_column(String(20), default="pending")
     idempotency_key: Mapped[str | None] = mapped_column(String(80), unique=True, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    related_entity_type: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
+    related_entity_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    approver_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
 
 
-class Expense(Base):
+class Expense(SyncedEntityMixin, Base):
     __tablename__ = "expenses"
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     branch_id: Mapped[str] = mapped_column(ForeignKey("branches.id"))
     category: Mapped[str] = mapped_column(String(80))
     amount: Mapped[float] = mapped_column(Float)
     description: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(20), default="pending")
     idempotency_key: Mapped[str | None] = mapped_column(String(80), unique=True, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class Notification(Base):

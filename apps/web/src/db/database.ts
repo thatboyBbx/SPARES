@@ -14,7 +14,8 @@ export interface Sale { id: string; productId: string; branchId: string; custome
 export interface PurchaseOrder { id: string; reference: string; supplierId: string; branchId: string; status: string; version: number; notes: string; createdBy: string; requestedAt: string; receivedAt?: string; }
 export interface PurchaseOrderLine { id: string; purchaseOrderId: string; productId: string; quantity: number; unitCost: number; createdAt: string; }
 export interface Notification { id: string; title: string; body: string; kind: string; read: boolean; createdAt: string; }
-export interface Approval { id: string; type: string; subject: string; requester: string; approver: string; priority: string; status: string; createdAt: string; }
+export interface Approval { id: string; type: string; subject: string; requester: string; approver: string; priority: string; status: string; deadline?: string | null; isOverdue?: boolean; relatedEntityType?: string | null; relatedEntityId?: string | null; createdAt: string; }
+export interface Expense { id: string; branchId: string; category: string; amount: number; description: string; status: string; createdAt: string; }
 interface OutboxEntry { id?: number; path: string; body: string; queuedAt: string; }
 
 /** A conflict (409) surfaced by a version-checked action, kept client-side
@@ -40,6 +41,7 @@ class SpopDatabase extends Dexie {
   purchaseOrderLines!: Table<PurchaseOrderLine, string>;
   notifications!: Table<Notification, string>;
   approvals!: Table<Approval, string>;
+  expenses!: Table<Expense, string>;
   outbox!: Table<OutboxEntry, number>;
 
   constructor() {
@@ -57,6 +59,7 @@ class SpopDatabase extends Dexie {
       purchaseOrderLines: "id, purchaseOrderId",
       notifications: "id, createdAt",
       approvals: "id, status",
+      expenses: "id, status",
       outbox: "++id",
     });
   }
@@ -88,11 +91,12 @@ export async function loadFromServer() {
     sales: Array<{ id: string; product_id: string; branch_id: string; customer_id: string | null; quantity: number; total: number; receipt_number: string; created_at: string }>;
     purchase_orders: Array<{ id: string; reference: string; supplier_id: string; branch_id: string; status: string; version: number; notes: string; created_by: string; requested_at: string; received_at?: string }>;
     purchase_order_lines: Array<{ id: string; purchase_order_id: string; product_id: string; quantity: number; unit_cost: number; created_at: string }>;
-    approvals: Array<{ id: string; type: string; subject: string; requester: string; approver: string; priority: string; status: string; created_at: string }>;
+    approvals: Array<{ id: string; type: string; subject: string; requester: string; approver: string; priority: string; status: string; deadline?: string | null; is_overdue?: boolean; related_entity_type?: string | null; related_entity_id?: string | null; created_at: string }>;
+    expenses: Array<{ id: string; branch_id: string; category: string; amount: number; description: string; status: string; created_at: string }>;
     notifications: Array<{ id: string; title: string; body: string; kind: string; read: boolean; created_at: string }>;
   };
-  await db.transaction("rw", [db.branches, db.products, db.categories, db.suppliers, db.customers, db.movements, db.transfers, db.sales, db.purchaseOrders, db.purchaseOrderLines, db.notifications, db.approvals], async () => {
-    await Promise.all([db.branches.clear(), db.products.clear(), db.categories.clear(), db.suppliers.clear(), db.customers.clear(), db.movements.clear(), db.transfers.clear(), db.sales.clear(), db.purchaseOrders.clear(), db.purchaseOrderLines.clear(), db.notifications.clear(), db.approvals.clear()]);
+  await db.transaction("rw", [db.branches, db.products, db.categories, db.suppliers, db.customers, db.movements, db.transfers, db.sales, db.purchaseOrders, db.purchaseOrderLines, db.notifications, db.approvals, db.expenses], async () => {
+    await Promise.all([db.branches.clear(), db.products.clear(), db.categories.clear(), db.suppliers.clear(), db.customers.clear(), db.movements.clear(), db.transfers.clear(), db.sales.clear(), db.purchaseOrders.clear(), db.purchaseOrderLines.clear(), db.notifications.clear(), db.approvals.clear(), db.expenses.clear()]);
     await db.branches.bulkPut(data.branches.map((b) => ({ id: b.id, name: b.name, type: b.kind })));
     await db.products.bulkPut(data.products.map((p) => ({ id: p.id, sku: p.sku, name: p.name, brand: p.brand, fitment: p.fitment, reorderLevel: p.reorder_level, sellingPrice: p.selling_price, categoryId: p.category_id })));
     await db.categories.bulkPut(data.categories.map((c) => ({ id: c.id, name: c.name, parentId: c.parent_id })));
@@ -103,7 +107,8 @@ export async function loadFromServer() {
     await db.sales.bulkPut(data.sales.map((s) => ({ id: s.id, productId: s.product_id, branchId: s.branch_id, customerId: s.customer_id, quantity: s.quantity, total: s.total, receiptNumber: s.receipt_number, createdAt: s.created_at })));
     await db.purchaseOrders.bulkPut(data.purchase_orders.map((order) => ({ id: order.id, reference: order.reference, supplierId: order.supplier_id, branchId: order.branch_id, status: order.status, version: order.version, notes: order.notes, createdBy: order.created_by, requestedAt: order.requested_at, receivedAt: order.received_at })));
     await db.purchaseOrderLines.bulkPut(data.purchase_order_lines.map((line) => ({ id: line.id, purchaseOrderId: line.purchase_order_id, productId: line.product_id, quantity: line.quantity, unitCost: line.unit_cost, createdAt: line.created_at })));
-    await db.approvals.bulkPut(data.approvals.map((approval) => ({ id: approval.id, type: approval.type, subject: approval.subject, requester: approval.requester, approver: approval.approver, priority: approval.priority, status: approval.status, createdAt: approval.created_at })));
+    await db.approvals.bulkPut(data.approvals.map((approval) => ({ id: approval.id, type: approval.type, subject: approval.subject, requester: approval.requester, approver: approval.approver, priority: approval.priority, status: approval.status, deadline: approval.deadline, isOverdue: approval.is_overdue, relatedEntityType: approval.related_entity_type, relatedEntityId: approval.related_entity_id, createdAt: approval.created_at })));
+    await db.expenses.bulkPut(data.expenses.map((expense) => ({ id: expense.id, branchId: expense.branch_id, category: expense.category, amount: expense.amount, description: expense.description, status: expense.status, createdAt: expense.created_at })));
     await db.notifications.bulkPut(data.notifications.map((notification) => ({ id: notification.id, title: notification.title, body: notification.body, kind: notification.kind, read: notification.read, createdAt: notification.created_at })));
   });
 }
@@ -155,7 +160,11 @@ export async function cancelTransfer(transferId: string) {
   await loadFromServer();
 }
 export async function createApproval(type: string, subject: string, requester: string, approver: string, priority: string) { await request("/approvals", { method: "POST", body: JSON.stringify({ type, subject, requester, approver, priority, client_request_id: localId() }) }); await loadFromServer(); }
+export async function approveApproval(approvalId: string) { await request(`/approvals/${approvalId}/approve`, { method: "POST" }); await loadFromServer(); }
+export async function rejectApproval(approvalId: string) { await request(`/approvals/${approvalId}/reject`, { method: "POST" }); await loadFromServer(); }
 export async function createExpense(branchId: string, category: string, amount: number, description: string) { await request("/expenses", { method: "POST", body: JSON.stringify({ branch_id: branchId, category, amount, description, client_request_id: localId() }) }); await loadFromServer(); }
+export async function approveExpense(expenseId: string) { await request(`/expenses/${expenseId}/approve`, { method: "POST" }); await loadFromServer(); }
+export async function rejectExpense(expenseId: string) { await request(`/expenses/${expenseId}/reject`, { method: "POST" }); await loadFromServer(); }
 export async function createPurchaseOrder(supplierId: string, branchId: string, notes: string, items: Array<{ productId: string; quantity: number; unitCost: number }>) {
   const body = { supplier_id: supplierId, branch_id: branchId, notes, items: items.map((item) => ({ product_id: item.productId, quantity: item.quantity, unit_cost: item.unitCost })), client_request_id: localId() };
   try { await request("/purchase-orders", { method: "POST", body: JSON.stringify(body) }); await loadFromServer(); }

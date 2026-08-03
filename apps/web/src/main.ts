@@ -1,6 +1,6 @@
 import "./index.css";
 import "./App.css";
-import { approvePurchaseOrder, cancelTransfer, createApproval, createCustomer, createExpense, createPurchaseOrder, db, dismissSyncIssue, fetchDailySales, fulfilTransfer, getSyncIssues, loadFromServer, markNotificationRead, pendingSyncCount, receivePurchaseOrder, receiveTransfer, recordReceipt, recordSale, recordTransfer, type Branch, type Customer, type Notification, type Product, type PurchaseOrder, type StockMovement, type Supplier, type Transfer } from "./db/database";
+import { approveApproval, approveExpense, approvePurchaseOrder, cancelTransfer, createApproval, createCustomer, createExpense, createPurchaseOrder, db, dismissSyncIssue, fetchDailySales, fulfilTransfer, getSyncIssues, loadFromServer, markNotificationRead, pendingSyncCount, receivePurchaseOrder, receiveTransfer, recordReceipt, recordSale, recordTransfer, rejectApproval, rejectExpense, type Approval, type Branch, type Customer, type Expense, type Notification, type Product, type PurchaseOrder, type StockMovement, type Supplier, type Transfer } from "./db/database";
 import { getCurrentUser, login, logout, registerDevice, request, type AuthUser } from "./lib/api";
 
 type View = "overview" | "catalogue" | "receipt" | "transfer" | "sale" | "approval" | "expense" | "ledger" | "purchase" | "notifications" | "reports" | "users";
@@ -31,6 +31,8 @@ let transfers: Transfer[] = [];
 let purchaseOrders: PurchaseOrder[] = [];
 let notifications: Notification[] = [];
 let customers: Customer[] = [];
+let approvals: Approval[] = [];
+let expenses: Expense[] = [];
 let dailySales: Array<{ day: string; sales_count: number; sales_total: number }> = [];
 let adminUsers: AuthUser[] = [];
 let currentUser: AuthUser | null = null;
@@ -51,6 +53,8 @@ async function refresh() {
   purchaseOrders = await db.purchaseOrders.orderBy("requestedAt").reverse().toArray();
   notifications = await db.notifications.orderBy("createdAt").reverse().toArray();
   customers = await db.customers.toArray();
+  approvals = await db.approvals.toArray();
+  expenses = await db.expenses.toArray();
   pendingSync = await pendingSyncCount();
   if (canSee("users")) {
     adminUsers = (await request("/users").catch(() => [])) as AuthUser[];
@@ -136,8 +140,8 @@ function content() {
     return `${form("Request a branch transfer", "transfer-form", `<label>Part<select name="product">${options(products)}</select></label><label>Quantity<input name="quantity" type="number" min="1" value="1" required></label><p class="hint">Creates a pending request; stock only moves once fulfilled and received.</p>`, "Request transfer")}<section class="card table-card"><div class="card-title"><h2>Awaiting fulfilment</h2><span>${requested.length} pending</span></div><table><thead><tr><th>Reference</th><th>Part</th><th>Quantity</th><th>Action</th></tr></thead><tbody>${requested.map((item) => `<tr><td>${escape(item.reference)}</td><td>${escape(product(item.productId)?.name ?? "Part")}</td><td>${item.quantity}</td><td>${canFulfil ? `<button class="secondary fulfil-transfer" data-transfer-id="${escape(item.id)}" data-transfer-reference="${escape(item.reference)}" data-transfer-version="${item.version}">Fulfil</button> <button class="secondary cancel-transfer" data-transfer-id="${escape(item.id)}">Cancel</button>` : "—"}</td></tr>`).join("") || "<tr><td colspan=\"4\">No pending requests.</td></tr>"}</tbody></table></section><section class="card table-card"><div class="card-title"><h2>In transit</h2><span>${inTransit.length} awaiting receipt</span></div><table><thead><tr><th>Reference</th><th>Part</th><th>Quantity</th><th>Action</th></tr></thead><tbody>${inTransit.map((item) => `<tr><td>${escape(item.reference)}</td><td>${escape(product(item.productId)?.name ?? "Part")}</td><td>${item.quantity}</td><td>${canReceive ? `<button class="secondary receive-transfer" data-transfer-id="${escape(item.id)}" data-transfer-reference="${escape(item.reference)}" data-transfer-version="${item.version}">Receive</button>` : "—"}</td></tr>`).join("") || "<tr><td colspan=\"4\">Nothing in transit.</td></tr>"}</tbody></table></section>`;
   }
   if (view === "sale") return `${form("Counter sale", "sale-form", `<label>Part<select name="product">${options(products)}</select></label><label>Quantity<input name="quantity" type="number" min="1" value="1" required></label><label>Customer (optional)<select name="customer"><option value="">Walk-in customer</option>${options(customers)}</select></label><p class="hint">Only available shop stock can be issued.</p>`, "Issue sale receipt")}<section class="card table-card"><div class="card-title"><h2>Add a customer</h2><span>${customers.length} on file</span></div><form id="customer-form" class="form"><label>Name<input name="name" required></label><label>Phone<input name="phone"></label><button class="primary">Add customer</button></form></section>`;
-  if (view === "approval") return form("Request an approval", "approval-form", `<label>Type<select name="type"><option>stock adjustment</option><option>price change</option><option>expense</option></select></label><label>Subject<input name="subject" required></label><label>Requester<input name="requester" required></label><label>Approver<input name="approver" required></label><label>Priority<select name="priority"><option>normal</option><option>high</option></select></label>`, "Send for approval");
-  if (view === "expense") return form("Record an operating expense", "expense-form", `<label>Branch<select name="branch">${options(branches)}</select></label><label>Category<select name="category"><option>delivery</option><option>utilities</option><option>maintenance</option></select></label><label>Amount (USD)<input name="amount" type="number" min="0.01" step="0.01" required></label><label>Description<input name="description" required></label>`, "Record expense");
+  if (view === "approval") return `${form("Request an approval", "approval-form", `<label>Type<select name="type"><option>stock adjustment</option><option>price change</option><option>expense</option></select></label><label>Subject<input name="subject" required></label><label>Approver<input name="approver" required></label><label>Priority<select name="priority"><option>normal</option><option>high</option></select></label>`, "Send for approval")}<section class="card table-card"><div class="card-title"><h2>Approval queue</h2><span>${approvals.filter((item) => item.status === "pending").length} pending</span></div><table><thead><tr><th>Subject</th><th>Requester</th><th>Priority</th><th>Status</th><th>Action</th></tr></thead><tbody>${approvals.map((item) => `<tr><td>${escape(item.subject)}${item.isOverdue ? ' <b class="danger">overdue</b>' : ""}</td><td>${escape(item.requester)}</td><td><span class="pill">${escape(item.priority)}</span></td><td><span class="pill">${escape(item.status)}</span></td><td>${item.status === "pending" ? `<button class="secondary approve-approval" data-approval-id="${escape(item.id)}">Approve</button> <button class="secondary reject-approval" data-approval-id="${escape(item.id)}">Reject</button>` : "—"}</td></tr>`).join("") || "<tr><td colspan=\"5\">No approvals yet.</td></tr>"}</tbody></table></section>`;
+  if (view === "expense") return `${form("Record an operating expense", "expense-form", `<label>Branch<select name="branch">${options(branches)}</select></label><label>Category<select name="category"><option>delivery</option><option>utilities</option><option>maintenance</option></select></label><label>Amount (USD)<input name="amount" type="number" min="0.01" step="0.01" required></label><label>Description<input name="description" required></label>`, "Record expense")}<section class="card table-card"><div class="card-title"><h2>Expenses</h2><span>${expenses.filter((item) => item.status === "pending").length} pending</span></div><table><thead><tr><th>Category</th><th>Description</th><th>Amount</th><th>Status</th><th>Action</th></tr></thead><tbody>${expenses.map((item) => `<tr><td>${escape(item.category)}</td><td>${escape(item.description)}</td><td>${money.format(item.amount)}</td><td><span class="pill">${escape(item.status)}</span></td><td>${item.status === "pending" ? `<button class="secondary approve-expense" data-expense-id="${escape(item.id)}">Approve</button> <button class="secondary reject-expense" data-expense-id="${escape(item.id)}">Reject</button>` : "—"}</td></tr>`).join("") || "<tr><td colspan=\"5\">No expenses recorded yet.</td></tr>"}</tbody></table></section>`;
   if (view === "purchase") {
     const canApprovePO = PURCHASE_ORDER_APPROVE_ROLES.includes(currentUser?.role ?? "");
     return `<section class="form-card"><p class="eyebrow">Planned replenishment</p><h2>Request a purchase order</h2><form id="purchase-form" class="form"><label>Supplier<select name="supplier">${options(suppliers)}</select></label><label>Branch<select name="branch">${options(branches)}</select></label><label>Part<select name="product">${options(products)}</select></label><label>Quantity<input name="quantity" type="number" min="1" value="1" required></label><label>Unit cost<input name="unit-cost" type="number" min="0.01" step="0.01" value="5" required></label><label>Notes<input name="notes"></label><button class="primary">Create purchase order</button></form></section><section class="card table-card"><div class="card-title"><h2>Open purchase orders</h2><span>${purchaseOrders.filter((order) => order.status !== "received").length} waiting</span></div><table><thead><tr><th>Reference</th><th>Supplier</th><th>Notes</th><th>Status</th><th>Action</th></tr></thead><tbody>${purchaseOrders.map((order) => {
@@ -300,16 +304,56 @@ function bind() {
   root.querySelector<HTMLFormElement>("#approval-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget as HTMLFormElement;
-    await createApproval(value(form, "type"), value(form, "subject"), value(form, "requester"), value(form, "approver"), value(form, "priority"));
+    await createApproval(value(form, "type"), value(form, "subject"), currentUser?.full_name ?? "", value(form, "approver"), value(form, "priority"));
+    await refresh();
+    view = "approval";
     render("Approval request sent.");
   });
+
+  root.querySelectorAll<HTMLButtonElement>(".approve-approval").forEach((button) => button.addEventListener("click", async () => {
+    const approvalId = button.dataset.approvalId;
+    if (!approvalId) return;
+    await approveApproval(approvalId);
+    await refresh();
+    view = "approval";
+    render("Approval approved.");
+  }));
+
+  root.querySelectorAll<HTMLButtonElement>(".reject-approval").forEach((button) => button.addEventListener("click", async () => {
+    const approvalId = button.dataset.approvalId;
+    if (!approvalId) return;
+    await rejectApproval(approvalId);
+    await refresh();
+    view = "approval";
+    render("Approval rejected.");
+  }));
 
   root.querySelector<HTMLFormElement>("#expense-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget as HTMLFormElement;
     await createExpense(value(form, "branch"), value(form, "category"), Number(value(form, "amount")), value(form, "description"));
+    await refresh();
+    view = "expense";
     render("Expense recorded.");
   });
+
+  root.querySelectorAll<HTMLButtonElement>(".approve-expense").forEach((button) => button.addEventListener("click", async () => {
+    const expenseId = button.dataset.expenseId;
+    if (!expenseId) return;
+    await approveExpense(expenseId);
+    await refresh();
+    view = "expense";
+    render("Expense approved.");
+  }));
+
+  root.querySelectorAll<HTMLButtonElement>(".reject-expense").forEach((button) => button.addEventListener("click", async () => {
+    const expenseId = button.dataset.expenseId;
+    if (!expenseId) return;
+    await rejectExpense(expenseId);
+    await refresh();
+    view = "expense";
+    render("Expense rejected.");
+  }));
 
   root.querySelector<HTMLFormElement>("#purchase-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
