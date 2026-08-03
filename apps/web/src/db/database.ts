@@ -7,9 +7,10 @@ export interface Branch { id: string; name: string; type: "warehouse" | "shop"; 
 export interface Product { id: string; sku: string; name: string; brand: string; fitment: string; reorderLevel: number; sellingPrice: number; categoryId?: string | null; }
 export interface Category { id: string; name: string; parentId: string | null; }
 export interface Supplier { id: string; name: string; phone: string; }
+export interface Customer { id: string; name: string; phone: string; }
 export interface StockMovement { id: string; productId: string; branchId: string; quantity: number; kind: MovementKind; reference: string; createdAt: string; createdBy: string; }
 export interface Transfer { id: string; reference: string; productId: string; fromBranchId: string; toBranchId: string; quantity: number; status: TransferStatus; version: number; requestedAt: string; fulfilledAt?: string | null; receivedAt?: string | null; }
-export interface Sale { id: string; productId: string; branchId: string; quantity: number; total: number; receiptNumber: string; createdAt: string; }
+export interface Sale { id: string; productId: string; branchId: string; customerId?: string | null; quantity: number; total: number; receiptNumber: string; createdAt: string; }
 export interface PurchaseOrder { id: string; reference: string; supplierId: string; branchId: string; status: string; version: number; notes: string; createdBy: string; requestedAt: string; receivedAt?: string; }
 export interface PurchaseOrderLine { id: string; purchaseOrderId: string; productId: string; quantity: number; unitCost: number; createdAt: string; }
 export interface Notification { id: string; title: string; body: string; kind: string; read: boolean; createdAt: string; }
@@ -31,6 +32,7 @@ class SpopDatabase extends Dexie {
   products!: Table<Product, string>;
   categories!: Table<Category, string>;
   suppliers!: Table<Supplier, string>;
+  customers!: Table<Customer, string>;
   movements!: Table<StockMovement, string>;
   transfers!: Table<Transfer, string>;
   sales!: Table<Sale, string>;
@@ -47,6 +49,7 @@ class SpopDatabase extends Dexie {
       products: "id, categoryId",
       categories: "id, parentId",
       suppliers: "id",
+      customers: "id, name",
       movements: "id, createdAt, productId, branchId",
       transfers: "id, requestedAt, status",
       sales: "id, createdAt",
@@ -79,23 +82,25 @@ export async function loadFromServer() {
     products: Array<{ id: string; sku: string; name: string; brand: string; fitment: string; reorder_level: number; selling_price: number; category_id: string | null }>;
     categories: Array<{ id: string; name: string; parent_id: string | null }>;
     suppliers: Supplier[];
+    customers: Customer[];
     movements: Array<{ id: string; product_id: string; branch_id: string; quantity: number; kind: MovementKind; reference: string; created_at: string; created_by: string }>;
     transfers: Array<{ id: string; reference: string; product_id: string; from_branch_id: string; to_branch_id: string; quantity: number; status: TransferStatus; version: number; created_at: string; fulfilled_at?: string | null; received_at?: string | null }>;
-    sales: Array<{ id: string; product_id: string; branch_id: string; quantity: number; total: number; receipt_number: string; created_at: string }>;
+    sales: Array<{ id: string; product_id: string; branch_id: string; customer_id: string | null; quantity: number; total: number; receipt_number: string; created_at: string }>;
     purchase_orders: Array<{ id: string; reference: string; supplier_id: string; branch_id: string; status: string; version: number; notes: string; created_by: string; requested_at: string; received_at?: string }>;
     purchase_order_lines: Array<{ id: string; purchase_order_id: string; product_id: string; quantity: number; unit_cost: number; created_at: string }>;
     approvals: Array<{ id: string; type: string; subject: string; requester: string; approver: string; priority: string; status: string; created_at: string }>;
     notifications: Array<{ id: string; title: string; body: string; kind: string; read: boolean; created_at: string }>;
   };
-  await db.transaction("rw", [db.branches, db.products, db.categories, db.suppliers, db.movements, db.transfers, db.sales, db.purchaseOrders, db.purchaseOrderLines, db.notifications, db.approvals], async () => {
-    await Promise.all([db.branches.clear(), db.products.clear(), db.categories.clear(), db.suppliers.clear(), db.movements.clear(), db.transfers.clear(), db.sales.clear(), db.purchaseOrders.clear(), db.purchaseOrderLines.clear(), db.notifications.clear(), db.approvals.clear()]);
+  await db.transaction("rw", [db.branches, db.products, db.categories, db.suppliers, db.customers, db.movements, db.transfers, db.sales, db.purchaseOrders, db.purchaseOrderLines, db.notifications, db.approvals], async () => {
+    await Promise.all([db.branches.clear(), db.products.clear(), db.categories.clear(), db.suppliers.clear(), db.customers.clear(), db.movements.clear(), db.transfers.clear(), db.sales.clear(), db.purchaseOrders.clear(), db.purchaseOrderLines.clear(), db.notifications.clear(), db.approvals.clear()]);
     await db.branches.bulkPut(data.branches.map((b) => ({ id: b.id, name: b.name, type: b.kind })));
     await db.products.bulkPut(data.products.map((p) => ({ id: p.id, sku: p.sku, name: p.name, brand: p.brand, fitment: p.fitment, reorderLevel: p.reorder_level, sellingPrice: p.selling_price, categoryId: p.category_id })));
     await db.categories.bulkPut(data.categories.map((c) => ({ id: c.id, name: c.name, parentId: c.parent_id })));
     await db.suppliers.bulkPut(data.suppliers.map((s) => s));
+    await db.customers.bulkPut(data.customers.map((c) => ({ id: c.id, name: c.name, phone: c.phone })));
     await db.movements.bulkPut(data.movements.map((m) => ({ id: m.id, productId: m.product_id, branchId: m.branch_id, quantity: m.quantity, kind: m.kind, reference: m.reference, createdAt: m.created_at, createdBy: m.created_by })));
     await db.transfers.bulkPut(data.transfers.map((t) => ({ id: t.id, reference: t.reference, productId: t.product_id, fromBranchId: t.from_branch_id, toBranchId: t.to_branch_id, quantity: t.quantity, status: t.status, version: t.version, requestedAt: t.created_at, fulfilledAt: t.fulfilled_at, receivedAt: t.received_at })));
-    await db.sales.bulkPut(data.sales.map((s) => ({ id: s.id, productId: s.product_id, branchId: s.branch_id, quantity: s.quantity, total: s.total, receiptNumber: s.receipt_number, createdAt: s.created_at })));
+    await db.sales.bulkPut(data.sales.map((s) => ({ id: s.id, productId: s.product_id, branchId: s.branch_id, customerId: s.customer_id, quantity: s.quantity, total: s.total, receiptNumber: s.receipt_number, createdAt: s.created_at })));
     await db.purchaseOrders.bulkPut(data.purchase_orders.map((order) => ({ id: order.id, reference: order.reference, supplierId: order.supplier_id, branchId: order.branch_id, status: order.status, version: order.version, notes: order.notes, createdBy: order.created_by, requestedAt: order.requested_at, receivedAt: order.received_at })));
     await db.purchaseOrderLines.bulkPut(data.purchase_order_lines.map((line) => ({ id: line.id, purchaseOrderId: line.purchase_order_id, productId: line.product_id, quantity: line.quantity, unitCost: line.unit_cost, createdAt: line.created_at })));
     await db.approvals.bulkPut(data.approvals.map((approval) => ({ id: approval.id, type: approval.type, subject: approval.subject, requester: approval.requester, approver: approval.approver, priority: approval.priority, status: approval.status, createdAt: approval.created_at })));
@@ -107,10 +112,18 @@ export async function recordReceipt(productId: string, branchId: string, quantit
   try { await request("/receipts", { method: "POST", body: JSON.stringify(body) }); await loadFromServer(); }
   catch { const reference = `OFFLINE-GRN-${Date.now()}`; await db.transaction("rw", db.movements, db.outbox, async () => { await db.movements.add({ id: localId(), productId, branchId, quantity, kind: "receipt", reference, createdAt: timestamp(), createdBy: "Offline operator" }); await queue("/receipts", body); }); }
 }
-export async function recordSale(product: Product, branchId: string, quantity: number) {
-  const body = { product_id: product.id, branch_id: branchId, quantity, client_request_id: localId() };
+export async function recordSale(product: Product, branchId: string, quantity: number, customerId?: string | null) {
+  const body = { product_id: product.id, branch_id: branchId, quantity, customer_id: customerId || null, client_request_id: localId() };
   try { await request("/sales", { method: "POST", body: JSON.stringify(body) }); await loadFromServer(); }
-  catch { const reference = `OFFLINE-S-${Date.now()}`; await db.transaction("rw", db.movements, db.sales, db.outbox, async () => { await db.movements.add({ id: localId(), productId: product.id, branchId, quantity: -quantity, kind: "sale", reference, createdAt: timestamp(), createdBy: "Offline operator" }); await db.sales.add({ id: localId(), productId: product.id, branchId, quantity, total: product.sellingPrice * quantity, receiptNumber: reference, createdAt: timestamp() }); await queue("/sales", body); }); }
+  catch { const reference = `OFFLINE-S-${Date.now()}`; await db.transaction("rw", db.movements, db.sales, db.outbox, async () => { await db.movements.add({ id: localId(), productId: product.id, branchId, quantity: -quantity, kind: "sale", reference, createdAt: timestamp(), createdBy: "Offline operator" }); await db.sales.add({ id: localId(), productId: product.id, branchId, customerId: customerId || null, quantity, total: product.sellingPrice * quantity, receiptNumber: reference, createdAt: timestamp() }); await queue("/sales", body); }); }
+}
+export async function createCustomer(name: string, phone: string): Promise<Customer> {
+  const customer = (await request("/customers", { method: "POST", body: JSON.stringify({ name, phone }) })) as { id: string; name: string; phone: string };
+  await db.customers.put({ id: customer.id, name: customer.name, phone: customer.phone });
+  return customer;
+}
+export async function fetchDailySales(): Promise<Array<{ day: string; sales_count: number; sales_total: number }>> {
+  return (await request("/reports/daily-sales")) as Array<{ day: string; sales_count: number; sales_total: number }>;
 }
 export async function recordTransfer(productId: string, fromBranchId: string, toBranchId: string, quantity: number) {
   // Only the request step can be queued offline: fulfilling and receiving

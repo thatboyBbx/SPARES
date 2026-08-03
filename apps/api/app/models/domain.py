@@ -115,16 +115,21 @@ class Transfer(SyncedEntityMixin, Base):
     received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class Sale(Base):
+class Customer(SyncedEntityMixin, Base):
+    __tablename__ = "customers"
+    name: Mapped[str] = mapped_column(String(160))
+    phone: Mapped[str] = mapped_column(String(50), default="")
+
+
+class Sale(SyncedEntityMixin, Base):
     __tablename__ = "sales"
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     receipt_number: Mapped[str] = mapped_column(String(80), unique=True)
     product_id: Mapped[str] = mapped_column(ForeignKey("products.id"))
     branch_id: Mapped[str] = mapped_column(ForeignKey("branches.id"))
+    customer_id: Mapped[str | None] = mapped_column(ForeignKey("customers.id"), nullable=True, index=True)
     quantity: Mapped[int] = mapped_column(Integer)
     total: Mapped[float] = mapped_column(Float)
     idempotency_key: Mapped[str | None] = mapped_column(String(80), unique=True, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class Approval(Base):

@@ -1,9 +1,9 @@
 import "./index.css";
 import "./App.css";
-import { cancelTransfer, createApproval, createExpense, createPurchaseOrder, db, dismissSyncIssue, fulfilTransfer, getSyncIssues, loadFromServer, markNotificationRead, pendingSyncCount, receivePurchaseOrder, receiveTransfer, recordReceipt, recordSale, recordTransfer, type Branch, type Notification, type Product, type PurchaseOrder, type StockMovement, type Supplier, type Transfer } from "./db/database";
+import { cancelTransfer, createApproval, createCustomer, createExpense, createPurchaseOrder, db, dismissSyncIssue, fetchDailySales, fulfilTransfer, getSyncIssues, loadFromServer, markNotificationRead, pendingSyncCount, receivePurchaseOrder, receiveTransfer, recordReceipt, recordSale, recordTransfer, type Branch, type Customer, type Notification, type Product, type PurchaseOrder, type StockMovement, type Supplier, type Transfer } from "./db/database";
 import { getCurrentUser, login, logout, registerDevice, request, type AuthUser } from "./lib/api";
 
-type View = "overview" | "catalogue" | "receipt" | "transfer" | "sale" | "approval" | "expense" | "ledger" | "purchase" | "notifications" | "users";
+type View = "overview" | "catalogue" | "receipt" | "transfer" | "sale" | "approval" | "expense" | "ledger" | "purchase" | "notifications" | "reports" | "users";
 const TRANSFER_FULFIL_ROLES = ["owner", "store_keeper", "super_admin"];
 const TRANSFER_RECEIVE_ROLES = ["owner", "store_keeper", "shop_manager", "super_admin"];
 const VIEW_ROLES: Record<View, string[] | null> = {
@@ -17,6 +17,7 @@ const VIEW_ROLES: Record<View, string[] | null> = {
   purchase: ["owner", "store_keeper", "super_admin"],
   notifications: null,
   ledger: null,
+  reports: null,
   users: ["owner", "super_admin"],
 };
 const canSee = (target: View) => !VIEW_ROLES[target] || VIEW_ROLES[target]!.includes(currentUser?.role ?? "");
@@ -28,6 +29,8 @@ let movements: StockMovement[] = [];
 let transfers: Transfer[] = [];
 let purchaseOrders: PurchaseOrder[] = [];
 let notifications: Notification[] = [];
+let customers: Customer[] = [];
+let dailySales: Array<{ day: string; sales_count: number; sales_total: number }> = [];
 let adminUsers: AuthUser[] = [];
 let currentUser: AuthUser | null = null;
 let pendingSync = 0;
@@ -46,10 +49,12 @@ async function refresh() {
   transfers = await db.transfers.orderBy("requestedAt").reverse().toArray();
   purchaseOrders = await db.purchaseOrders.orderBy("requestedAt").reverse().toArray();
   notifications = await db.notifications.orderBy("createdAt").reverse().toArray();
+  customers = await db.customers.toArray();
   pendingSync = await pendingSyncCount();
   if (canSee("users")) {
     adminUsers = (await request("/users").catch(() => [])) as AuthUser[];
   }
+  dailySales = await fetchDailySales().catch(() => []);
 }
 
 async function sync() {
@@ -92,6 +97,7 @@ function nav() {
     ["purchase", "Purchasing"],
     ["notifications", "Notifications"],
     ["ledger", "Audit ledger"],
+    ["reports", "Sales reports"],
     ["users", "Users"],
   ] as [View, string][]).filter(([id]) => canSee(id)).map(([id, label]) => `<button data-view="${id}" class="${view === id ? "active" : ""}">${label}</button>`).join("");
 }
@@ -112,6 +118,7 @@ function title() {
     purchase: "Purchasing workflow",
     notifications: "Operator inbox",
     ledger: "Immutable stock ledger",
+    reports: "Daily sales report",
     users: "User management",
   })[view];
 }
@@ -127,11 +134,12 @@ function content() {
     const inTransit = transfers.filter((item) => item.status === "in_transit");
     return `${form("Request a branch transfer", "transfer-form", `<label>Part<select name="product">${options(products)}</select></label><label>Quantity<input name="quantity" type="number" min="1" value="1" required></label><p class="hint">Creates a pending request; stock only moves once fulfilled and received.</p>`, "Request transfer")}<section class="card table-card"><div class="card-title"><h2>Awaiting fulfilment</h2><span>${requested.length} pending</span></div><table><thead><tr><th>Reference</th><th>Part</th><th>Quantity</th><th>Action</th></tr></thead><tbody>${requested.map((item) => `<tr><td>${escape(item.reference)}</td><td>${escape(product(item.productId)?.name ?? "Part")}</td><td>${item.quantity}</td><td>${canFulfil ? `<button class="secondary fulfil-transfer" data-transfer-id="${escape(item.id)}" data-transfer-reference="${escape(item.reference)}" data-transfer-version="${item.version}">Fulfil</button> <button class="secondary cancel-transfer" data-transfer-id="${escape(item.id)}">Cancel</button>` : "—"}</td></tr>`).join("") || "<tr><td colspan=\"4\">No pending requests.</td></tr>"}</tbody></table></section><section class="card table-card"><div class="card-title"><h2>In transit</h2><span>${inTransit.length} awaiting receipt</span></div><table><thead><tr><th>Reference</th><th>Part</th><th>Quantity</th><th>Action</th></tr></thead><tbody>${inTransit.map((item) => `<tr><td>${escape(item.reference)}</td><td>${escape(product(item.productId)?.name ?? "Part")}</td><td>${item.quantity}</td><td>${canReceive ? `<button class="secondary receive-transfer" data-transfer-id="${escape(item.id)}" data-transfer-reference="${escape(item.reference)}" data-transfer-version="${item.version}">Receive</button>` : "—"}</td></tr>`).join("") || "<tr><td colspan=\"4\">Nothing in transit.</td></tr>"}</tbody></table></section>`;
   }
-  if (view === "sale") return form("Counter sale", "sale-form", `<label>Part<select name="product">${options(products)}</select></label><label>Quantity<input name="quantity" type="number" min="1" value="1" required></label><p class="hint">Only available shop stock can be issued.</p>`, "Issue sale receipt");
+  if (view === "sale") return `${form("Counter sale", "sale-form", `<label>Part<select name="product">${options(products)}</select></label><label>Quantity<input name="quantity" type="number" min="1" value="1" required></label><label>Customer (optional)<select name="customer"><option value="">Walk-in customer</option>${options(customers)}</select></label><p class="hint">Only available shop stock can be issued.</p>`, "Issue sale receipt")}<section class="card table-card"><div class="card-title"><h2>Add a customer</h2><span>${customers.length} on file</span></div><form id="customer-form" class="form"><label>Name<input name="name" required></label><label>Phone<input name="phone"></label><button class="primary">Add customer</button></form></section>`;
   if (view === "approval") return form("Request an approval", "approval-form", `<label>Type<select name="type"><option>stock adjustment</option><option>price change</option><option>expense</option></select></label><label>Subject<input name="subject" required></label><label>Requester<input name="requester" required></label><label>Approver<input name="approver" required></label><label>Priority<select name="priority"><option>normal</option><option>high</option></select></label>`, "Send for approval");
   if (view === "expense") return form("Record an operating expense", "expense-form", `<label>Branch<select name="branch">${options(branches)}</select></label><label>Category<select name="category"><option>delivery</option><option>utilities</option><option>maintenance</option></select></label><label>Amount (USD)<input name="amount" type="number" min="0.01" step="0.01" required></label><label>Description<input name="description" required></label>`, "Record expense");
   if (view === "purchase") return `<section class="form-card"><p class="eyebrow">Planned replenishment</p><h2>Request a purchase order</h2><form id="purchase-form" class="form"><label>Supplier<select name="supplier">${options(suppliers)}</select></label><label>Branch<select name="branch">${options(branches)}</select></label><label>Part<select name="product">${options(products)}</select></label><label>Quantity<input name="quantity" type="number" min="1" value="1" required></label><label>Unit cost<input name="unit-cost" type="number" min="0.01" step="0.01" value="5" required></label><label>Notes<input name="notes"></label><button class="primary">Create purchase order</button></form></section><section class="card table-card"><div class="card-title"><h2>Open purchase orders</h2><span>${purchaseOrders.filter((order) => order.status === "pending").length} waiting to receive</span></div><table><thead><tr><th>Reference</th><th>Supplier</th><th>Notes</th><th>Status</th><th>Action</th></tr></thead><tbody>${purchaseOrders.map((order) => `<tr><td>${escape(order.reference)}</td><td>${escape(suppliers.find((supplier) => supplier.id === order.supplierId)?.name ?? order.supplierId)}</td><td>${escape(order.notes)}</td><td>${escape(order.status)}</td><td>${order.status === "pending" ? `<button class="secondary receive-order" data-order-id="${escape(order.id)}" data-order-reference="${escape(order.reference)}" data-order-version="${order.version}">Receive</button>` : "—"}</td></tr>`).join("")}</tbody></table></section>`;
   if (view === "notifications") return `<section class="card table-card"><div class="card-title"><h2>Operator inbox</h2><span>${notifications.filter((item) => !item.read).length} unread</span></div>${notifications.map((item) => `<div class="row"><div><strong>${escape(item.title)}</strong><small>${escape(item.body)}</small></div><div>${item.read ? '<b class="good">Read</b>' : `<button class="secondary mark-read" data-notification-id="${escape(item.id)}">Mark read</button>`}</div></div>`).join("") || "<p>No notifications yet.</p>"}</section>`;
+  if (view === "reports") return `<section class="card table-card"><div class="card-title"><h2>Daily sales</h2><span>${dailySales.length} days recorded</span></div><table><thead><tr><th>Day</th><th>Sales count</th><th>Sales total</th></tr></thead><tbody>${dailySales.map((row) => `<tr><td>${escape(row.day)}</td><td>${row.sales_count}</td><td>${money.format(row.sales_total)}</td></tr>`).join("") || "<tr><td colspan=\"3\">No sales recorded yet.</td></tr>"}</tbody></table></section>`;
   if (view === "users") return `<section class="form-card"><p class="eyebrow">Access control</p><h2>Create an operator account</h2><form id="user-form" class="form"><label>Full name<input name="full_name" required></label><label>Email<input name="email" type="email" required></label><label>Temporary password<input name="password" type="password" required></label><label>Role<select name="role"><option value="owner">Owner</option><option value="accountant">Accountant</option><option value="store_keeper">Store Keeper</option><option value="shop_manager">Shop Manager</option><option value="cashier" selected>Cashier</option><option value="super_admin">Super Admin</option></select></label><label>Branch<select name="branch"><option value="">Unassigned</option>${options(branches)}</select></label><button class="primary">Create user</button></form></section><section class="card table-card"><div class="card-title"><h2>Operator roster</h2><span>${adminUsers.length} accounts</span></div><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Branch</th><th>Status</th></tr></thead><tbody>${adminUsers.map((item) => `<tr><td>${escape(item.full_name)}</td><td>${escape(item.email)}</td><td><span class="pill">${escape(item.role)}</span></td><td>${escape(branches.find((entry) => entry.id === item.branch_id)?.name ?? "—")}</td><td>${item.is_active ? '<b class="good">Active</b>' : '<b class="danger">Disabled</b>'}</td></tr>`).join("")}</tbody></table></section>`;
   return `<section class="card table-card"><div class="card-title"><h2>Movement evidence</h2><span>Append-only · newest first</span></div><table><thead><tr><th>Time</th><th>Part</th><th>Branch</th><th>Event</th><th>Change</th><th>Reference</th></tr></thead><tbody>${movements.map((item) => `<tr><td>${new Date(item.createdAt).toLocaleString()}</td><td>${escape(product(item.productId)?.name ?? "Part")}</td><td>${escape(branches.find((entry) => entry.id === item.branchId)?.name ?? "Branch")}</td><td><span class="pill">${escape(item.kind.replace("_", " "))}</span></td><td class="${item.quantity > 0 ? "positive" : "negative"}">${item.quantity > 0 ? "+" : ""}${item.quantity}</td><td>${escape(item.reference)}</td></tr>`).join("")}</tbody></table></section>`;
 }
@@ -259,10 +267,23 @@ function bind() {
     const form = event.currentTarget as HTMLFormElement;
     const selected = product(value(form, "product"));
     if (!selected || !branch("shop")) return;
-    await recordSale(selected, branch("shop")!.id, Number(value(form, "quantity")));
+    await recordSale(selected, branch("shop")!.id, Number(value(form, "quantity")), value(form, "customer") || null);
     await refresh();
     view = "ledger";
     render("Sale saved or queued for sync.");
+  });
+
+  root.querySelector<HTMLFormElement>("#customer-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget as HTMLFormElement;
+    try {
+      await createCustomer(value(form, "name"), value(form, "phone"));
+      await refresh();
+      view = "sale";
+      render("Customer added.");
+    } catch (error) {
+      render(error instanceof Error ? error.message : "Could not add customer.");
+    }
   });
 
   root.querySelector<HTMLFormElement>("#approval-form")?.addEventListener("submit", async (event) => {

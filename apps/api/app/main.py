@@ -15,7 +15,7 @@ from app.core.config import get_settings
 from app.core.permissions import CAN_APPROVE, CAN_FULFIL_TRANSFER, CAN_MANAGE_STOCK_RECEIPTS, CAN_MANAGE_USERS, CAN_RECEIVE_TRANSFER, CAN_RECORD_SALE, CAN_REQUEST_TRANSFER
 from app.db.base import Base, SyncStatus
 from app.db.session import engine, get_db
-from app.models import Approval, Branch, Category, Device, Expense, Notification, Product, PurchaseOrder, PurchaseOrderLine, PurchaseReceipt, Sale, StockMovement, Supplier, Transfer, User, UserRole
+from app.models import Approval, Branch, Category, Customer, Device, Expense, Notification, Product, PurchaseOrder, PurchaseOrderLine, PurchaseReceipt, Sale, StockMovement, Supplier, Transfer, User, UserRole
 from app.seed import seed_database
 
 # Sentinel for mixin-backed rows written by a plain HTTP request rather than
@@ -70,7 +70,13 @@ class SaleIn(BaseModel):
     product_id: str
     branch_id: str
     quantity: int = Field(gt=0)
+    customer_id: str | None = None
     client_request_id: str | None = None
+
+
+class CustomerIn(BaseModel):
+    name: str
+    phone: str = ""
 
 class ApprovalIn(BaseModel):
     type: str
@@ -165,7 +171,7 @@ def bootstrap(
     products = db.scalars(select(Product).order_by(Product.name)).all()
     branches = db.scalars(select(Branch).order_by(Branch.kind)).all()
     movements = db.scalars(select(StockMovement).order_by(StockMovement.created_at.desc())).all()
-    return {"users": [serialize(u) for u in db.scalars(select(User)).all()], "products": [serialize(p) for p in products], "categories": [serialize(c) for c in db.scalars(select(Category).order_by(Category.name)).all()], "branches": [serialize(b) for b in branches], "suppliers": [serialize(s) for s in db.scalars(select(Supplier)).all()], "movements": [serialize(m) for m in movements], "transfers": [serialize(t) for t in db.scalars(select(Transfer).order_by(Transfer.created_at.desc())).all()], "sales": [serialize(s) for s in db.scalars(select(Sale).order_by(Sale.created_at.desc())).all()], "purchase_orders": [serialize(o) for o in db.scalars(select(PurchaseOrder).order_by(PurchaseOrder.requested_at.desc())).all()], "purchase_order_lines": [serialize(l) for l in db.scalars(select(PurchaseOrderLine).order_by(PurchaseOrderLine.created_at.desc())).all()], "approvals": [serialize(a) for a in db.scalars(select(Approval).order_by(Approval.created_at.desc())).all()], "expenses": [serialize(e) for e in db.scalars(select(Expense).order_by(Expense.created_at.desc())).all()], "notifications": [serialize(n) for n in db.scalars(select(Notification).order_by(Notification.created_at.desc())).all()]}
+    return {"users": [serialize(u) for u in db.scalars(select(User)).all()], "products": [serialize(p) for p in products], "categories": [serialize(c) for c in db.scalars(select(Category).order_by(Category.name)).all()], "branches": [serialize(b) for b in branches], "suppliers": [serialize(s) for s in db.scalars(select(Supplier)).all()], "customers": [serialize(c) for c in db.scalars(select(Customer).order_by(Customer.name)).all()], "movements": [serialize(m) for m in movements], "transfers": [serialize(t) for t in db.scalars(select(Transfer).order_by(Transfer.created_at.desc())).all()], "sales": [serialize(s) for s in db.scalars(select(Sale).order_by(Sale.created_at.desc())).all()], "purchase_orders": [serialize(o) for o in db.scalars(select(PurchaseOrder).order_by(PurchaseOrder.requested_at.desc())).all()], "purchase_order_lines": [serialize(l) for l in db.scalars(select(PurchaseOrderLine).order_by(PurchaseOrderLine.created_at.desc())).all()], "approvals": [serialize(a) for a in db.scalars(select(Approval).order_by(Approval.created_at.desc())).all()], "expenses": [serialize(e) for e in db.scalars(select(Expense).order_by(Expense.created_at.desc())).all()], "notifications": [serialize(n) for n in db.scalars(select(Notification).order_by(Notification.created_at.desc())).all()]}
 
 @app.post("/api/v1/auth/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)) -> dict:
@@ -513,11 +519,37 @@ def create_sale(
         existing = db.scalar(select(Sale).where(Sale.idempotency_key == payload.client_request_id))
         if existing: return {"receipt_number": existing.receipt_number, "total": existing.total, "message": "Sale already posted"}
     product = require(db, Product, payload.product_id); require(db, Branch, payload.branch_id)
+    if payload.customer_id:
+        require(db, Customer, payload.customer_id)
     if branch_stock(db, payload.product_id, payload.branch_id) < payload.quantity: raise HTTPException(422, "Insufficient branch stock")
     ref = reference("S")
     total = product.selling_price * payload.quantity
-    db.add(Sale(receipt_number=ref, product_id=payload.product_id, branch_id=payload.branch_id, quantity=payload.quantity, total=total, idempotency_key=payload.client_request_id)); db.add(StockMovement(product_id=payload.product_id, branch_id=payload.branch_id, quantity=-payload.quantity, kind="sale", reference=ref, created_by=current_user.full_name, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)); db.commit()
+    db.add(Sale(receipt_number=ref, product_id=payload.product_id, branch_id=payload.branch_id, customer_id=payload.customer_id, quantity=payload.quantity, total=total, idempotency_key=payload.client_request_id, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)); db.add(StockMovement(product_id=payload.product_id, branch_id=payload.branch_id, quantity=-payload.quantity, kind="sale", reference=ref, created_by=current_user.full_name, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)); db.commit()
     return {"receipt_number": ref, "total": total, "message": "Sale recorded"}
+
+
+@app.get("/api/v1/customers")
+def list_customers(
+    q: str | None = None,
+    db: Session = Depends(get_db),
+    _: Annotated[User, Depends(get_current_user)] = None,
+) -> list[dict]:
+    query = select(Customer)
+    if q:
+        query = query.where(Customer.name.ilike(f"%{q}%"))
+    return [serialize(customer) for customer in db.scalars(query.order_by(Customer.name)).all()]
+
+
+@app.post("/api/v1/customers", status_code=201)
+def create_customer(
+    payload: CustomerIn,
+    db: Session = Depends(get_db),
+    current_user: Annotated[User, Depends(require_roles(*CAN_RECORD_SALE))] = None,
+) -> dict:
+    customer = Customer(name=payload.name, phone=payload.phone, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)
+    db.add(customer)
+    db.commit()
+    return serialize(customer)
 
 @app.get("/api/v1/approvals")
 def list_approvals(
