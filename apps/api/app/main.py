@@ -10,11 +10,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.core.auth import create_access_token, get_current_user, hash_password, require_roles, verify_password
+from app.core.auth import create_access_token, create_refresh_token, get_current_user, hash_password, require_roles, revoke_refresh_token, rotate_refresh_token, verify_and_upgrade_password
 from app.core.config import get_settings
+from app.core.permissions import CAN_APPROVE, CAN_MANAGE_STOCK_RECEIPTS, CAN_MANAGE_USERS, CAN_RECORD_SALE, CAN_REQUEST_TRANSFER
 from app.db.base import Base
 from app.db.session import engine, get_db
-from app.models import Approval, Branch, Expense, Notification, Product, PurchaseOrder, PurchaseOrderLine, PurchaseReceipt, Sale, StockMovement, Supplier, Transfer, User
+from app.models import Approval, Branch, Device, Expense, Notification, Product, PurchaseOrder, PurchaseOrderLine, PurchaseReceipt, Sale, StockMovement, Supplier, Transfer, User, UserRole
 from app.seed import seed_database
 
 settings = get_settings()
@@ -87,6 +88,37 @@ class ExpenseIn(BaseModel):
 class LoginIn(BaseModel):
     email: str
     password: str
+    device_id: str | None = None
+
+
+class RefreshIn(BaseModel):
+    refresh_token: str
+
+
+class DeviceRegisterIn(BaseModel):
+    device_id: str
+    platform: str = "web"
+    push_token: str | None = None
+
+
+class UserCreateIn(BaseModel):
+    email: str
+    full_name: str
+    password: str
+    role: UserRole
+    branch_id: str | None = None
+
+
+class UserUpdateIn(BaseModel):
+    role: UserRole | None = None
+    branch_id: str | None = None
+    is_active: bool | None = None
+
+
+class BranchIn(BaseModel):
+    name: str
+    kind: str
+    address: str = ""
 
 def reference(prefix: str) -> str:
     return f"{prefix}-{datetime.now(timezone.utc):%y%m%d%H%M%S}-{str(uuid4())[:4].upper()}"
@@ -117,19 +149,124 @@ def bootstrap(
 @app.post("/api/v1/auth/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)) -> dict:
     user = db.scalar(select(User).where(User.email == payload.email))
-    if not user or not verify_password(payload.password, user.hashed_password):
+    if not user or not verify_and_upgrade_password(user, payload.password, db):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")
-    return {"user": serialize(user), "access_token": create_access_token(str(user.id), user.role), "token_type": "bearer"}
+    access_token = create_access_token(user.id, user.role.value)
+    refresh_token = create_refresh_token(db, user.id, payload.device_id)
+    return {"user": serialize(user), "access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
+
+
+@app.post("/api/v1/auth/refresh")
+def refresh_tokens(payload: RefreshIn, db: Session = Depends(get_db)) -> dict:
+    access_token, refresh_token, _ = rotate_refresh_token(db, payload.refresh_token)
+    return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
+
+
+@app.post("/api/v1/auth/logout", status_code=204)
+def logout(payload: RefreshIn, db: Session = Depends(get_db)) -> None:
+    revoke_refresh_token(db, payload.refresh_token)
+
 
 @app.get("/api/v1/auth/me")
 def current_user(user: Annotated[User, Depends(get_current_user)]) -> dict:
     return {"user": serialize(user)}
 
+
+@app.post("/api/v1/devices/register", status_code=201)
+def register_device(
+    payload: DeviceRegisterIn,
+    db: Session = Depends(get_db),
+    user: Annotated[User, Depends(get_current_user)] = None,
+) -> dict:
+    device = db.scalar(select(Device).where(Device.user_id == user.id, Device.device_id == payload.device_id))
+    if device:
+        device.platform = payload.platform
+        if payload.push_token is not None:
+            device.push_token = payload.push_token
+        device.last_seen_at = datetime.now(timezone.utc)
+    else:
+        device = Device(user_id=user.id, device_id=payload.device_id, platform=payload.platform, push_token=payload.push_token, created_by_id=user.id)
+        db.add(device)
+    db.commit()
+    return serialize(device)
+
+
+@app.get("/api/v1/devices")
+def list_devices(
+    db: Session = Depends(get_db),
+    user: Annotated[User, Depends(get_current_user)] = None,
+) -> list[dict]:
+    devices = db.scalars(select(Device).where(Device.user_id == user.id)).all()
+    return [serialize(device) for device in devices]
+
+
+@app.get("/api/v1/users")
+def list_users(
+    db: Session = Depends(get_db),
+    _: Annotated[User, Depends(require_roles(*CAN_MANAGE_USERS))] = None,
+) -> list[dict]:
+    return [serialize(user) for user in db.scalars(select(User).order_by(User.full_name)).all()]
+
+
+@app.post("/api/v1/users", status_code=201)
+def create_user(
+    payload: UserCreateIn,
+    db: Session = Depends(get_db),
+    _: Annotated[User, Depends(require_roles(*CAN_MANAGE_USERS))] = None,
+) -> dict:
+    if db.scalar(select(User).where(User.email == payload.email)):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Email already registered")
+    if payload.branch_id:
+        require(db, Branch, payload.branch_id)
+    user = User(id=str(uuid4()), email=payload.email, full_name=payload.full_name, hashed_password=hash_password(payload.password), role=payload.role, branch_id=payload.branch_id)
+    db.add(user)
+    db.commit()
+    return serialize(user)
+
+
+@app.patch("/api/v1/users/{user_id}")
+def update_user(
+    user_id: str,
+    payload: UserUpdateIn,
+    db: Session = Depends(get_db),
+    _: Annotated[User, Depends(require_roles(*CAN_MANAGE_USERS))] = None,
+) -> dict:
+    user = require(db, User, user_id)
+    if payload.branch_id is not None:
+        require(db, Branch, payload.branch_id)
+        user.branch_id = payload.branch_id
+    if payload.role is not None:
+        user.role = payload.role
+    if payload.is_active is not None:
+        user.is_active = payload.is_active
+    db.commit()
+    return serialize(user)
+
+
+@app.get("/api/v1/branches")
+def list_branches(
+    db: Session = Depends(get_db),
+    _: Annotated[User, Depends(get_current_user)] = None,
+) -> list[dict]:
+    return [serialize(item) for item in db.scalars(select(Branch).order_by(Branch.kind)).all()]
+
+
+@app.post("/api/v1/branches", status_code=201)
+def create_branch(
+    payload: BranchIn,
+    db: Session = Depends(get_db),
+    _: Annotated[User, Depends(require_roles(*CAN_MANAGE_USERS))] = None,
+) -> dict:
+    branch = Branch(name=payload.name, kind=payload.kind, address=payload.address)
+    db.add(branch)
+    db.commit()
+    return serialize(branch)
+
 @app.post("/api/v1/receipts", status_code=201)
 def create_receipt(
     payload: ReceiptIn,
     db: Session = Depends(get_db),
-    _: Annotated[User, Depends(require_roles("owner", "store_keeper"))] = None,
+    _: Annotated[User, Depends(require_roles(*CAN_MANAGE_STOCK_RECEIPTS))] = None,
 ) -> dict:
     if payload.client_request_id:
         existing = db.scalar(select(PurchaseReceipt).where(PurchaseReceipt.idempotency_key == payload.client_request_id))
@@ -144,7 +281,7 @@ def create_receipt(
 def create_purchase_order(
     payload: PurchaseOrderIn,
     db: Session = Depends(get_db),
-    current_user: Annotated[User, Depends(require_roles("owner", "store_keeper"))] = None,
+    current_user: Annotated[User, Depends(require_roles(*CAN_MANAGE_STOCK_RECEIPTS))] = None,
 ) -> dict:
     if not payload.items:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "At least one item is required")
@@ -179,7 +316,7 @@ def list_purchase_orders(
 def receive_purchase_order(
     purchase_order_id: str,
     db: Session = Depends(get_db),
-    _: Annotated[User, Depends(require_roles("owner", "store_keeper"))] = None,
+    _: Annotated[User, Depends(require_roles(*CAN_MANAGE_STOCK_RECEIPTS))] = None,
 ) -> dict:
     order = require(db, PurchaseOrder, purchase_order_id)
     if order.status == "received":
@@ -207,7 +344,7 @@ def receive_purchase_order(
 def create_transfer(
     payload: TransferIn,
     db: Session = Depends(get_db),
-    _: Annotated[User, Depends(require_roles("owner", "store_keeper", "shop_manager"))] = None,
+    _: Annotated[User, Depends(require_roles(*CAN_REQUEST_TRANSFER))] = None,
 ) -> dict:
     if payload.client_request_id:
         existing = db.scalar(select(Transfer).where(Transfer.idempotency_key == payload.client_request_id))
@@ -226,7 +363,7 @@ def create_transfer(
 def create_sale(
     payload: SaleIn,
     db: Session = Depends(get_db),
-    _: Annotated[User, Depends(require_roles("owner", "cashier", "shop_manager"))] = None,
+    _: Annotated[User, Depends(require_roles(*CAN_RECORD_SALE))] = None,
 ) -> dict:
     if payload.client_request_id:
         existing = db.scalar(select(Sale).where(Sale.idempotency_key == payload.client_request_id))
@@ -251,7 +388,7 @@ def list_approvals(
 def create_approval(
     payload: ApprovalIn,
     db: Session = Depends(get_db),
-    _: Annotated[User, Depends(require_roles("owner", "accountant"))] = None,
+    _: Annotated[User, Depends(require_roles(*CAN_APPROVE))] = None,
 ) -> dict:
     approval = Approval(**payload.model_dump()); db.add(approval); db.add(Notification(title="Approval requested", body=payload.subject, kind="approval")); db.commit(); return serialize(approval)
 
@@ -260,7 +397,7 @@ def create_approval(
 def approve(
     approval_id: str,
     db: Session = Depends(get_db),
-    _: Annotated[User, Depends(require_roles("owner", "accountant"))] = None,
+    _: Annotated[User, Depends(require_roles(*CAN_APPROVE))] = None,
 ) -> dict:
     approval = require(db, Approval, approval_id); approval.status = "approved"; db.commit(); return serialize(approval)
 
@@ -269,7 +406,7 @@ def approve(
 def reject_approval(
     approval_id: str,
     db: Session = Depends(get_db),
-    _: Annotated[User, Depends(require_roles("owner", "accountant"))] = None,
+    _: Annotated[User, Depends(require_roles(*CAN_APPROVE))] = None,
 ) -> dict:
     approval = require(db, Approval, approval_id); approval.status = "rejected"; db.commit(); return serialize(approval)
 
@@ -278,7 +415,7 @@ def reject_approval(
 def create_expense(
     payload: ExpenseIn,
     db: Session = Depends(get_db),
-    _: Annotated[User, Depends(require_roles("owner", "accountant"))] = None,
+    _: Annotated[User, Depends(require_roles(*CAN_APPROVE))] = None,
 ) -> dict:
     require(db, Branch, payload.branch_id); expense = Expense(**payload.model_dump()); db.add(expense); db.add(Notification(title="Expense awaiting approval", body=payload.description, kind="expense")); db.commit(); return serialize(expense)
 

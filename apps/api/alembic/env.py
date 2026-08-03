@@ -17,7 +17,7 @@ from app.core.config import get_settings
 # before autogenerate runs. Add new model modules to this list as they're
 # created in later phases.
 from app.db.base import Base
-from app.models import domain, user  # noqa: F401  (imported for side-effect: table registration)
+from app.models import auth, domain, user  # noqa: F401  (imported for side-effect: table registration)
 
 config = context.config
 

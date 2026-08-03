@@ -28,11 +28,64 @@ def test_login_and_me_endpoint_work() -> None:
 
     body = response.json()
     assert body["access_token"]
+    assert body["refresh_token"]
     assert body["user"]["email"] == "owner@sparepilot.local"
 
     me_response = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {body['access_token']}"})
     assert me_response.status_code == 200
     assert me_response.json()["user"]["role"] == "owner"
+
+
+def test_refresh_token_rotates_and_old_token_becomes_invalid() -> None:
+    login_response = client.post("/api/v1/auth/login", json={"email": "owner@sparepilot.local", "password": "pilot123"})
+    old_refresh_token = login_response.json()["refresh_token"]
+
+    refresh_response = client.post("/api/v1/auth/refresh", json={"refresh_token": old_refresh_token})
+    assert refresh_response.status_code == 200
+    body = refresh_response.json()
+    assert body["access_token"]
+    assert body["refresh_token"]
+    assert body["refresh_token"] != old_refresh_token
+
+    reuse_response = client.post("/api/v1/auth/refresh", json={"refresh_token": old_refresh_token})
+    assert reuse_response.status_code == 401
+
+
+def test_logout_revokes_refresh_token() -> None:
+    login_response = client.post("/api/v1/auth/login", json={"email": "owner@sparepilot.local", "password": "pilot123"})
+    refresh_token = login_response.json()["refresh_token"]
+
+    logout_response = client.post("/api/v1/auth/logout", json={"refresh_token": refresh_token})
+    assert logout_response.status_code == 204
+
+    refresh_response = client.post("/api/v1/auth/refresh", json={"refresh_token": refresh_token})
+    assert refresh_response.status_code == 401
+
+
+def test_role_mismatch_returns_403() -> None:
+    login_response = client.post("/api/v1/auth/login", json={"email": "cashier@sparepilot.local", "password": "pilot123"})
+    token = login_response.json()["access_token"]
+
+    response = client.post(
+        "/api/v1/receipts",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"product_id": "part-oil-filter", "branch_id": "branch-warehouse", "supplier_id": "supplier-motovac", "quantity": 2},
+    )
+    assert response.status_code == 403
+
+
+def test_device_registration_round_trip() -> None:
+    login_response = client.post("/api/v1/auth/login", json={"email": "owner@sparepilot.local", "password": "pilot123", "device_id": "device-abc"})
+    token = login_response.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    register_response = client.post("/api/v1/devices/register", headers=headers, json={"device_id": "device-abc", "platform": "web"})
+    assert register_response.status_code == 201
+    assert register_response.json()["device_id"] == "device-abc"
+
+    list_response = client.get("/api/v1/devices", headers=headers)
+    assert list_response.status_code == 200
+    assert any(device["device_id"] == "device-abc" for device in list_response.json())
 
 
 def test_protected_receipt_endpoint_requires_auth() -> None:

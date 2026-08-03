@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.auth import hash_password
-from app.models import Branch, Product, PurchaseReceipt, StockMovement, Supplier, User
+from app.models import Branch, Product, PurchaseReceipt, StockMovement, Supplier, User, UserRole
 
 
 def seed_database(db: Session) -> None:
@@ -17,7 +17,8 @@ def seed_database(db: Session) -> None:
     for row in data["users"]:
         user = row.copy()
         password = user.pop("password")
-        db.add(User(**user, hashed_password=hash_password(password)))
+        role = UserRole(user.pop("role"))
+        db.add(User(**user, role=role, hashed_password=hash_password(password)))
     db.add_all([Branch(**row) for row in data["branches"]])
     db.add_all([Supplier(**row) for row in data["suppliers"]])
     db.add_all([Product(**row) for row in data["products"]])

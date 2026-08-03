@@ -1,9 +1,23 @@
 import "./index.css";
 import "./App.css";
 import { createApproval, createExpense, createPurchaseOrder, db, loadFromServer, markNotificationRead, pendingSyncCount, receivePurchaseOrder, recordReceipt, recordSale, recordTransfer, type Branch, type Notification, type Product, type PurchaseOrder, type StockMovement, type Supplier, type Transfer } from "./db/database";
-import { clearAuthToken, getCurrentUser, login, type AuthUser } from "./lib/api";
+import { getCurrentUser, login, logout, registerDevice, request, type AuthUser } from "./lib/api";
 
-type View = "overview" | "catalogue" | "receipt" | "transfer" | "sale" | "approval" | "expense" | "ledger" | "purchase" | "notifications";
+type View = "overview" | "catalogue" | "receipt" | "transfer" | "sale" | "approval" | "expense" | "ledger" | "purchase" | "notifications" | "users";
+const VIEW_ROLES: Record<View, string[] | null> = {
+  overview: null,
+  catalogue: null,
+  receipt: ["owner", "store_keeper", "super_admin"],
+  transfer: ["owner", "store_keeper", "shop_manager", "super_admin"],
+  sale: ["owner", "cashier", "shop_manager", "super_admin"],
+  approval: ["owner", "accountant", "super_admin"],
+  expense: ["owner", "accountant", "super_admin"],
+  purchase: ["owner", "store_keeper", "super_admin"],
+  notifications: null,
+  ledger: null,
+  users: ["owner", "super_admin"],
+};
+const canSee = (target: View) => !VIEW_ROLES[target] || VIEW_ROLES[target]!.includes(currentUser?.role ?? "");
 let view: View = "overview";
 let branches: Branch[] = [];
 let products: Product[] = [];
@@ -12,6 +26,7 @@ let movements: StockMovement[] = [];
 let transfers: Transfer[] = [];
 let purchaseOrders: PurchaseOrder[] = [];
 let notifications: Notification[] = [];
+let adminUsers: AuthUser[] = [];
 let currentUser: AuthUser | null = null;
 let pendingSync = 0;
 const money = new Intl.NumberFormat("en-ZW", { style: "currency", currency: "USD" });
@@ -30,6 +45,9 @@ async function refresh() {
   purchaseOrders = await db.purchaseOrders.orderBy("requestedAt").reverse().toArray();
   notifications = await db.notifications.orderBy("createdAt").reverse().toArray();
   pendingSync = await pendingSyncCount();
+  if (canSee("users")) {
+    adminUsers = (await request("/users").catch(() => [])) as AuthUser[];
+  }
 }
 
 async function sync() {
@@ -52,9 +70,9 @@ async function initialize() {
   try {
     const response = await getCurrentUser();
     currentUser = response.user;
+    await registerDevice();
     await sync();
   } catch {
-    clearAuthToken();
     currentUser = null;
     renderLogin("Please sign in to continue.");
   }
@@ -72,7 +90,8 @@ function nav() {
     ["purchase", "Purchasing"],
     ["notifications", "Notifications"],
     ["ledger", "Audit ledger"],
-  ] as [View, string][]).map(([id, label]) => `<button data-view="${id}" class="${view === id ? "active" : ""}">${label}</button>`).join("");
+    ["users", "Users"],
+  ] as [View, string][]).filter(([id]) => canSee(id)).map(([id, label]) => `<button data-view="${id}" class="${view === id ? "active" : ""}">${label}</button>`).join("");
 }
 
 function options(rows: { id: string; name: string }[]) {
@@ -91,6 +110,7 @@ function title() {
     purchase: "Purchasing workflow",
     notifications: "Operator inbox",
     ledger: "Immutable stock ledger",
+    users: "User management",
   })[view];
 }
 function content() {
@@ -104,6 +124,7 @@ function content() {
   if (view === "expense") return form("Record an operating expense", "expense-form", `<label>Branch<select name="branch">${options(branches)}</select></label><label>Category<select name="category"><option>delivery</option><option>utilities</option><option>maintenance</option></select></label><label>Amount (USD)<input name="amount" type="number" min="0.01" step="0.01" required></label><label>Description<input name="description" required></label>`, "Record expense");
   if (view === "purchase") return `<section class="form-card"><p class="eyebrow">Planned replenishment</p><h2>Request a purchase order</h2><form id="purchase-form" class="form"><label>Supplier<select name="supplier">${options(suppliers)}</select></label><label>Branch<select name="branch">${options(branches)}</select></label><label>Part<select name="product">${options(products)}</select></label><label>Quantity<input name="quantity" type="number" min="1" value="1" required></label><label>Unit cost<input name="unit-cost" type="number" min="0.01" step="0.01" value="5" required></label><label>Notes<input name="notes"></label><button class="primary">Create purchase order</button></form></section><section class="card table-card"><div class="card-title"><h2>Open purchase orders</h2><span>${purchaseOrders.filter((order) => order.status === "pending").length} waiting to receive</span></div><table><thead><tr><th>Reference</th><th>Supplier</th><th>Notes</th><th>Status</th><th>Action</th></tr></thead><tbody>${purchaseOrders.map((order) => `<tr><td>${escape(order.reference)}</td><td>${escape(suppliers.find((supplier) => supplier.id === order.supplierId)?.name ?? order.supplierId)}</td><td>${escape(order.notes)}</td><td>${escape(order.status)}</td><td>${order.status === "pending" ? `<button class="secondary receive-order" data-order-id="${escape(order.id)}">Receive</button>` : "—"}</td></tr>`).join("")}</tbody></table></section>`;
   if (view === "notifications") return `<section class="card table-card"><div class="card-title"><h2>Operator inbox</h2><span>${notifications.filter((item) => !item.read).length} unread</span></div>${notifications.map((item) => `<div class="row"><div><strong>${escape(item.title)}</strong><small>${escape(item.body)}</small></div><div>${item.read ? '<b class="good">Read</b>' : `<button class="secondary mark-read" data-notification-id="${escape(item.id)}">Mark read</button>`}</div></div>`).join("") || "<p>No notifications yet.</p>"}</section>`;
+  if (view === "users") return `<section class="form-card"><p class="eyebrow">Access control</p><h2>Create an operator account</h2><form id="user-form" class="form"><label>Full name<input name="full_name" required></label><label>Email<input name="email" type="email" required></label><label>Temporary password<input name="password" type="password" required></label><label>Role<select name="role"><option value="owner">Owner</option><option value="accountant">Accountant</option><option value="store_keeper">Store Keeper</option><option value="shop_manager">Shop Manager</option><option value="cashier" selected>Cashier</option><option value="super_admin">Super Admin</option></select></label><label>Branch<select name="branch"><option value="">Unassigned</option>${options(branches)}</select></label><button class="primary">Create user</button></form></section><section class="card table-card"><div class="card-title"><h2>Operator roster</h2><span>${adminUsers.length} accounts</span></div><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Branch</th><th>Status</th></tr></thead><tbody>${adminUsers.map((item) => `<tr><td>${escape(item.full_name)}</td><td>${escape(item.email)}</td><td><span class="pill">${escape(item.role)}</span></td><td>${escape(branches.find((entry) => entry.id === item.branch_id)?.name ?? "—")}</td><td>${item.is_active ? '<b class="good">Active</b>' : '<b class="danger">Disabled</b>'}</td></tr>`).join("")}</tbody></table></section>`;
   return `<section class="card table-card"><div class="card-title"><h2>Movement evidence</h2><span>Append-only · newest first</span></div><table><thead><tr><th>Time</th><th>Part</th><th>Branch</th><th>Event</th><th>Change</th><th>Reference</th></tr></thead><tbody>${movements.map((item) => `<tr><td>${new Date(item.createdAt).toLocaleString()}</td><td>${escape(product(item.productId)?.name ?? "Part")}</td><td>${escape(branches.find((entry) => entry.id === item.branchId)?.name ?? "Branch")}</td><td><span class="pill">${escape(item.kind.replace("_", " "))}</span></td><td class="${item.quantity > 0 ? "positive" : "negative"}">${item.quantity > 0 ? "+" : ""}${item.quantity}</td><td>${escape(item.reference)}</td></tr>`).join("")}</tbody></table></section>`;
 }
 function form(heading: string, id: string, fields: string, action: string) {
@@ -144,8 +165,8 @@ function bind() {
     }
   });
 
-  root.querySelector<HTMLButtonElement>("#logout-button")?.addEventListener("click", () => {
-    clearAuthToken();
+  root.querySelector<HTMLButtonElement>("#logout-button")?.addEventListener("click", async () => {
+    await logout();
     currentUser = null;
     renderLogin("Signed out.");
   });
@@ -205,6 +226,19 @@ function bind() {
     await refresh();
     view = "purchase";
     render("Purchase order queued or synced.");
+  });
+
+  root.querySelector<HTMLFormElement>("#user-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget as HTMLFormElement;
+    try {
+      await request("/users", { method: "POST", body: JSON.stringify({ full_name: value(form, "full_name"), email: value(form, "email"), password: value(form, "password"), role: value(form, "role"), branch_id: value(form, "branch") || null }) });
+      await refresh();
+      view = "users";
+      render("User account created.");
+    } catch (error) {
+      render(error instanceof Error ? error.message : "Could not create user.");
+    }
   });
 
   root.querySelectorAll<HTMLButtonElement>(".receive-order").forEach((button) => button.addEventListener("click", async () => {

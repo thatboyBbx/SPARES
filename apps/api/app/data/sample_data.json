@@ -2,7 +2,10 @@
   "users": [
     {"id": "bb29ea01-d751-4ea4-a746-b0329116da5f", "email": "owner@sparepilot.local", "full_name": "Nyasha Moyo", "role": "owner", "branch_id": null, "password": "pilot123"},
     {"id": "ee377f96-2fcd-4bbd-8f2b-d190d516f4fb", "email": "warehouse@sparepilot.local", "full_name": "Kudzai Dube", "role": "store_keeper", "branch_id": "branch-warehouse", "password": "pilot123"},
-    {"id": "0a7f3c55-8b49-4cc0-aa30-b18375c10753", "email": "shop@sparepilot.local", "full_name": "Tariro Kamanga", "role": "shop_manager", "branch_id": "branch-shop", "password": "pilot123"}
+    {"id": "0a7f3c55-8b49-4cc0-aa30-b18375c10753", "email": "shop@sparepilot.local", "full_name": "Tariro Kamanga", "role": "shop_manager", "branch_id": "branch-shop", "password": "pilot123"},
+    {"id": "4d1e3a2b-6f10-4d3a-9c2e-1a2b3c4d5e6f", "email": "cashier@sparepilot.local", "full_name": "Rutendo Chikafu", "role": "cashier", "branch_id": "branch-shop", "password": "pilot123"},
+    {"id": "5e2f4b3c-7021-4e4b-8d3f-2b3c4d5e6f70", "email": "accounts@sparepilot.local", "full_name": "Farai Mutasa", "role": "accountant", "branch_id": null, "password": "pilot123"},
+    {"id": "6f3a5c4d-8132-4f5c-9e40-3c4d5e6f7081", "email": "admin@sparepilot.local", "full_name": "Chipo Ncube", "role": "super_admin", "branch_id": null, "password": "pilot123"}
   ],
   "branches": [
     {"id": "branch-warehouse", "name": "Belvedere Warehouse", "kind": "warehouse", "address": "Belvedere, Harare"},

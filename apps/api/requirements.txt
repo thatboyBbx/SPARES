@@ -13,7 +13,8 @@ pydantic-settings==2.7.1
 
 # --- Auth ---
 python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
+passlib==1.7.4
+bcrypt==4.0.1  # passlib 1.7.4's self-test breaks on bcrypt>=4.1's strict 72-byte limit
 python-multipart==0.0.20
 
 # --- Background jobs / cache ---
