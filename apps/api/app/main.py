@@ -342,6 +342,23 @@ def list_purchase_orders(
     return [serialize(order) for order in orders]
 
 
+@app.post("/api/v1/purchase-orders/{purchase_order_id}/approve", status_code=201)
+def approve_purchase_order(
+    purchase_order_id: str,
+    db: Session = Depends(get_db),
+    current_user: Annotated[User, Depends(require_roles(*CAN_APPROVE))] = None,
+) -> dict:
+    order = require(db, PurchaseOrder, purchase_order_id)
+    if order.status != "requested":
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Purchase order is {order.status}, expected requested")
+    order.status = "approved"
+    order.approved_by_id = current_user.id
+    order.approved_at = datetime.now(timezone.utc)
+    db.add(Notification(title="Purchase order approved", body=f"{order.reference} is approved and ready to receive.", kind="purchase_order"))
+    db.commit()
+    return {"reference": order.reference, "status": order.status, "version": order.version, "message": "Purchase order approved"}
+
+
 @app.post("/api/v1/purchase-orders/{purchase_order_id}/receive", status_code=201)
 def receive_purchase_order(
     purchase_order_id: str,
@@ -356,6 +373,8 @@ def receive_purchase_order(
         order.sync_status = SyncStatus.CONFLICT
         db.commit()
         raise HTTPException(status.HTTP_409_CONFLICT, f"Purchase order changed since it was loaded (expected version {payload.expected_version}, currently {order.version})")
+    if order.status != "approved":
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Purchase order is {order.status}, expected approved")
 
     lines = db.scalars(select(PurchaseOrderLine).where(PurchaseOrderLine.purchase_order_id == purchase_order_id)).all()
     if not lines:
@@ -365,7 +384,11 @@ def receive_purchase_order(
         require(db, Product, line.product_id)
         require(db, Branch, order.branch_id)
         receipt_reference = reference("GRN")
-        db.add(PurchaseReceipt(reference=receipt_reference, supplier_id=order.supplier_id, branch_id=order.branch_id, product_id=line.product_id, quantity=line.quantity, idempotency_key=None, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id))
+        # Deterministic per-line key: a retried receive call is provably
+        # idempotent at the DB layer, not solely via the order-status
+        # short-circuit above.
+        receipt_idempotency_key = f"po-receive-{order.id}-{line.id}"
+        db.add(PurchaseReceipt(reference=receipt_reference, supplier_id=order.supplier_id, branch_id=order.branch_id, product_id=line.product_id, quantity=line.quantity, idempotency_key=receipt_idempotency_key, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id))
         db.add(StockMovement(product_id=line.product_id, branch_id=order.branch_id, quantity=line.quantity, kind="receipt", reference=receipt_reference, created_by=current_user.full_name, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id))
 
     order.status = "received"
@@ -645,7 +668,7 @@ def report_overview(
     products = db.scalars(select(Product)).all(); branches = db.scalars(select(Branch)).all()
     stock = [{"product_id": p.id, "branch_id": b.id, "quantity": branch_stock(db, p.id, b.id)} for p in products for b in branches]
     low = [row for row in stock if row["quantity"] <= next(p.reorder_level for p in products if p.id == row["product_id"])]
-    return {"sales_total": float(db.scalar(select(func.coalesce(func.sum(Sale.total), 0))) or 0), "sales_count": int(db.scalar(select(func.count(Sale.id))) or 0), "pending_approvals": int(db.scalar(select(func.count(Approval.id)).where(Approval.status == "pending")) or 0), "pending_purchase_orders": int(db.scalar(select(func.count(PurchaseOrder.id)).where(PurchaseOrder.status == "pending")) or 0), "stock": stock, "low_stock": low}
+    return {"sales_total": float(db.scalar(select(func.coalesce(func.sum(Sale.total), 0))) or 0), "sales_count": int(db.scalar(select(func.count(Sale.id))) or 0), "pending_approvals": int(db.scalar(select(func.count(Approval.id)).where(Approval.status == "pending")) or 0), "pending_purchase_orders": int(db.scalar(select(func.count(PurchaseOrder.id)).where(PurchaseOrder.status != "received")) or 0), "stock": stock, "low_stock": low}
 
 @app.get("/api/v1/reports/daily-sales")
 def daily_sales(

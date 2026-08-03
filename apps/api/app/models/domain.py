@@ -77,14 +77,17 @@ class PurchaseReceipt(SyncedEntityMixin, Base):
 
 
 class PurchaseOrder(SyncedEntityMixin, Base):
+    """Three-step workflow: requested -> approved -> received."""
     __tablename__ = "purchase_orders"
     reference: Mapped[str] = mapped_column(String(80), unique=True)
     supplier_id: Mapped[str] = mapped_column(ForeignKey("suppliers.id"), index=True)
     branch_id: Mapped[str] = mapped_column(ForeignKey("branches.id"), index=True)
-    status: Mapped[str] = mapped_column(String(30), default="pending")
+    status: Mapped[str] = mapped_column(String(30), default="requested")
     notes: Mapped[str] = mapped_column(Text, default="")
     created_by: Mapped[str] = mapped_column(String(120), default="System")
     idempotency_key: Mapped[str | None] = mapped_column(String(80), unique=True, nullable=True)
+    approved_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

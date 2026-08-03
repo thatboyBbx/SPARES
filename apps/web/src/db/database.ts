@@ -161,6 +161,10 @@ export async function createPurchaseOrder(supplierId: string, branchId: string, 
   try { await request("/purchase-orders", { method: "POST", body: JSON.stringify(body) }); await loadFromServer(); }
   catch { await queue("/purchase-orders", body); }
 }
+export async function approvePurchaseOrder(orderId: string) {
+  await request(`/purchase-orders/${orderId}/approve`, { method: "POST" });
+  await loadFromServer();
+}
 export async function receivePurchaseOrder(orderId: string, reference: string, expectedVersion: number) {
   try {
     await request(`/purchase-orders/${orderId}/receive`, { method: "POST", body: JSON.stringify({ expected_version: expectedVersion }) });

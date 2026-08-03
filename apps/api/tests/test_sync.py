@@ -114,12 +114,14 @@ def test_purchase_order_receive_is_conflict_checked() -> None:
     stale = client.post(f"/api/v1/purchase-orders/{order['id']}/receive", headers=owner, json={"expected_version": 2})
     assert stale.status_code == 409
 
-    # Flagging sync_status=conflict on the mismatch itself bumps version, so
-    # the retry must use the post-conflict version, not the original one.
-    listed = client.get("/api/v1/purchase-orders", headers=owner)
-    current = next(item for item in listed.json() if item["id"] == order["id"])
+    # A receive attempt against a not-yet-approved order is also correctly
+    # rejected (422, not the version-conflict 409) once expected_version is
+    # right - approve first, matching Phase 5's requested->approved->received
+    # workflow.
+    approve_response = client.post(f"/api/v1/purchase-orders/{order['id']}/approve", headers=owner)
+    assert approve_response.status_code == 201
 
-    correct = client.post(f"/api/v1/purchase-orders/{order['id']}/receive", headers=owner, json={"expected_version": current["version"]})
+    correct = client.post(f"/api/v1/purchase-orders/{order['id']}/receive", headers=owner, json={"expected_version": approve_response.json()["version"]})
     assert correct.status_code == 201
 
 
