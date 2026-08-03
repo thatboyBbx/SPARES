@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.core.auth import create_access_token, create_refresh_token, get_current_user, hash_password, require_roles, revoke_refresh_token, rotate_refresh_token, verify_and_upgrade_password
 from app.core.config import get_settings
+from app.core.notifications import dispatch_notification
 from app.core.permissions import CAN_APPROVE, CAN_FULFIL_TRANSFER, CAN_MANAGE_STOCK_RECEIPTS, CAN_MANAGE_USERS, CAN_RECEIVE_TRANSFER, CAN_RECORD_SALE, CAN_REQUEST_TRANSFER
 from app.db.base import Base, SyncStatus, as_aware_utc
 from app.db.session import engine, get_db
@@ -133,6 +134,17 @@ class DeviceRegisterIn(BaseModel):
     push_token: str | None = None
 
 
+class PushTokenIn(BaseModel):
+    device_id: str
+    push_token: str
+
+
+class SyncFailureIn(BaseModel):
+    path: str
+    error: str = ""
+    attempts: int = 0
+
+
 class UserCreateIn(BaseModel):
     email: str
     full_name: str
@@ -157,6 +169,19 @@ def reference(prefix: str) -> str:
 
 def branch_stock(db: Session, product_id: str, branch_id: str) -> int:
     return int(db.scalar(select(func.coalesce(func.sum(StockMovement.quantity), 0)).where(StockMovement.product_id == product_id, StockMovement.branch_id == branch_id)) or 0)
+
+
+def notify_if_crossing_low_stock(db: Session, product: Product, branch_id: str, movement_quantity: int) -> None:
+    """Fire once, on the specific movement that pushes stock from at/above
+    the reorder level to below it — not on every subsequent sale while it
+    stays low."""
+    if movement_quantity >= 0:
+        return
+    db.flush()
+    current = branch_stock(db, product.id, branch_id)
+    previous = current - movement_quantity
+    if previous >= product.reorder_level and current < product.reorder_level:
+        dispatch_notification(db, title=f"Low stock: {product.name}", body=f"{product.name} is at {current} units at this branch (reorder level {product.reorder_level}).", kind="low_stock")
 
 def require(db: Session, model: type, identity: str):
     record = db.get(model, identity)
@@ -420,7 +445,7 @@ def create_purchase_order(
         for item in payload.items
     ])
     create_linked_approval(db, type_="purchase_order", subject=f"Purchase order {order_reference} ({len(payload.items)} items)", requester=current_user, related_entity_type="purchase_order", related_entity_id=order.id)
-    db.add(Notification(title="Purchase order requested", body=f"{order_reference} was created for {len(payload.items)} items.", kind="purchase_order"))
+    dispatch_notification(db, title="Purchase order requested", body=f"{order_reference} was created for {len(payload.items)} items.", kind="purchase_order")
     db.commit()
     return {"id": order.id, "reference": order_reference, "status": order.status, "version": order.version, "message": "Purchase order requested"}
 
@@ -446,7 +471,7 @@ def approve_purchase_order(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Purchase order is {order.status}, expected requested")
     approval = find_linked_approval(db, "purchase_order", order.id)
     dispatch_approval_decision(db, approval, "approved", current_user)
-    db.add(Notification(title="Purchase order approved", body=f"{order.reference} is approved and ready to receive.", kind="purchase_order"))
+    dispatch_notification(db, title="Purchase order approved", body=f"{order.reference} is approved and ready to receive.", kind="purchase_order")
     db.commit()
     return {"reference": order.reference, "status": order.status, "version": order.version, "message": "Purchase order approved"}
 
@@ -485,7 +510,7 @@ def receive_purchase_order(
 
     order.status = "received"
     order.received_at = datetime.now(timezone.utc)
-    db.add(Notification(title="Goods received", body=f"{order.reference} completed and posted to stock.", kind="purchase_order"))
+    dispatch_notification(db, title="Goods received", body=f"{order.reference} completed and posted to stock.", kind="purchase_order")
     db.commit()
     return {"reference": order.reference, "received_lines": len(lines), "version": order.version, "message": "Purchase order received"}
 
@@ -505,7 +530,7 @@ def create_transfer(
     ref = reference("TRF")
     transfer = Transfer(reference=ref, product_id=payload.product_id, from_branch_id=payload.from_branch_id, to_branch_id=payload.to_branch_id, quantity=payload.quantity, idempotency_key=payload.client_request_id, status="requested", device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)
     db.add(transfer)
-    db.add(Notification(title="Transfer requested", body=f"{ref} awaits fulfilment from the source branch.", kind="transfer"))
+    dispatch_notification(db, title="Transfer requested", body=f"{ref} awaits fulfilment from the source branch.", kind="transfer")
     db.commit()
     return {"id": transfer.id, "reference": ref, "status": transfer.status, "version": transfer.version, "message": "Transfer requested"}
 
@@ -543,10 +568,11 @@ def fulfil_transfer(
     if branch_stock(db, transfer.product_id, transfer.from_branch_id) < transfer.quantity:
         raise HTTPException(422, "Insufficient origin stock")
     db.add(StockMovement(product_id=transfer.product_id, branch_id=transfer.from_branch_id, quantity=-transfer.quantity, kind="transfer_out", reference=transfer.reference, created_by=current_user.full_name, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id))
+    notify_if_crossing_low_stock(db, require(db, Product, transfer.product_id), transfer.from_branch_id, -transfer.quantity)
     transfer.status = "in_transit"
     transfer.fulfilled_by_id = current_user.id
     transfer.fulfilled_at = datetime.now(timezone.utc)
-    db.add(Notification(title="Transfer in transit", body=f"{transfer.reference} left the source branch.", kind="transfer"))
+    dispatch_notification(db, title="Transfer in transit", body=f"{transfer.reference} left the source branch.", kind="transfer")
     db.commit()
     return {"reference": transfer.reference, "status": transfer.status, "version": transfer.version, "message": "Transfer fulfilled"}
 
@@ -569,7 +595,7 @@ def receive_transfer(
     transfer.status = "received"
     transfer.received_by_id = current_user.id
     transfer.received_at = datetime.now(timezone.utc)
-    db.add(Notification(title="Transfer received", body=f"{transfer.reference} is available at the destination branch.", kind="transfer"))
+    dispatch_notification(db, title="Transfer received", body=f"{transfer.reference} is available at the destination branch.", kind="transfer")
     db.commit()
     return {"reference": transfer.reference, "status": transfer.status, "version": transfer.version, "message": "Transfer received"}
 
@@ -645,7 +671,7 @@ def update_product_price(
         related_entity_type="product",
         related_entity_id=product.id,
     )
-    db.add(Notification(title="Price change requested", body=approval.subject, kind="approval"))
+    dispatch_notification(db, title="Price change requested", body=approval.subject, kind="approval")
     db.commit()
     return {"approval": serialize_approval(approval), "message": "Price change submitted for approval"}
 
@@ -664,7 +690,9 @@ def create_sale(
     if branch_stock(db, payload.product_id, payload.branch_id) < payload.quantity: raise HTTPException(422, "Insufficient branch stock")
     ref = reference("S")
     total = product.selling_price * payload.quantity
-    db.add(Sale(receipt_number=ref, product_id=payload.product_id, branch_id=payload.branch_id, customer_id=payload.customer_id, quantity=payload.quantity, total=total, idempotency_key=payload.client_request_id, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)); db.add(StockMovement(product_id=payload.product_id, branch_id=payload.branch_id, quantity=-payload.quantity, kind="sale", reference=ref, created_by=current_user.full_name, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)); db.commit()
+    db.add(Sale(receipt_number=ref, product_id=payload.product_id, branch_id=payload.branch_id, customer_id=payload.customer_id, quantity=payload.quantity, total=total, idempotency_key=payload.client_request_id, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)); db.add(StockMovement(product_id=payload.product_id, branch_id=payload.branch_id, quantity=-payload.quantity, kind="sale", reference=ref, created_by=current_user.full_name, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id))
+    notify_if_crossing_low_stock(db, product, payload.branch_id, -payload.quantity)
+    db.commit()
     return {"receipt_number": ref, "total": total, "message": "Sale recorded"}
 
 
@@ -713,7 +741,7 @@ def create_approval(
         if existing: return serialize_approval(existing)
     fields = payload.model_dump(exclude={"client_request_id", "deadline"})
     approval = Approval(**fields, idempotency_key=payload.client_request_id, deadline=payload.deadline or default_deadline(), device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)
-    db.add(approval); db.add(Notification(title="Approval requested", body=payload.subject, kind="approval")); db.commit(); return serialize_approval(approval)
+    db.add(approval); dispatch_notification(db, title="Approval requested", body=payload.subject, kind="approval"); db.commit(); return serialize_approval(approval)
 
 
 @app.post("/api/v1/approvals/{approval_id}/approve")
@@ -757,7 +785,7 @@ def create_expense(
     db.add(expense)
     db.flush()
     create_linked_approval(db, type_="expense", subject=f"Expense: {payload.description}", requester=current_user, related_entity_type="expense", related_entity_id=expense.id)
-    db.add(Notification(title="Expense awaiting approval", body=payload.description, kind="expense")); db.commit(); return serialize(expense)
+    dispatch_notification(db, title="Expense awaiting approval", body=payload.description, kind="expense"); db.commit(); return serialize(expense)
 
 
 @app.post("/api/v1/expenses/{expense_id}/approve")
@@ -816,6 +844,36 @@ def unread_notification_count(
 ) -> dict:
     count = int(db.scalar(select(func.count(Notification.id)).where(Notification.read.is_(False))) or 0)
     return {"unread_count": count}
+
+
+@app.post("/api/v1/notifications/push-token")
+def register_push_token(
+    payload: PushTokenIn,
+    db: Session = Depends(get_db),
+    user: Annotated[User, Depends(get_current_user)] = None,
+) -> dict:
+    device = db.scalar(select(Device).where(Device.user_id == user.id, Device.device_id == payload.device_id))
+    if not device:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Device not registered; call /devices/register first")
+    device.push_token = payload.push_token
+    db.commit()
+    return serialize(device)
+
+
+@app.post("/api/v1/sync/report-failure", status_code=201)
+def report_sync_failure(
+    payload: SyncFailureIn,
+    db: Session = Depends(get_db),
+    _: Annotated[User, Depends(get_current_user)] = None,
+) -> dict:
+    notification = dispatch_notification(
+        db,
+        title="Sync failed",
+        body=f"{payload.path} failed to sync after {payload.attempts} attempts: {payload.error or 'unknown error'}",
+        kind="sync_failed",
+    )
+    db.commit()
+    return serialize(notification)
 
 
 @app.get("/api/v1/reports/overview")

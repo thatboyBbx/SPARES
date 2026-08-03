@@ -1,5 +1,26 @@
 import Dexie, { type Table } from "dexie";
-import { ApiError, request } from "../lib/api";
+import { ApiError, getDeviceId, request } from "../lib/api";
+
+/** Only present when the deployment has real Web Push configured — kept
+ * unset in this environment, so the "Enable push notifications" button
+ * stays hidden rather than prompting for a permission nothing backs. */
+export function pushNotificationsAvailable(): boolean {
+  return Boolean(import.meta.env.VITE_FIREBASE_VAPID_KEY);
+}
+
+export async function enablePushNotifications(): Promise<void> {
+  const vapidKey = import.meta.env.VITE_FIREBASE_VAPID_KEY as string | undefined;
+  if (!vapidKey || !("serviceWorker" in navigator) || !("PushManager" in window)) {
+    throw new Error("Push notifications are not available on this device.");
+  }
+  const permission = await Notification.requestPermission();
+  if (permission !== "granted") {
+    throw new Error("Notification permission was not granted.");
+  }
+  const registration = await navigator.serviceWorker.ready;
+  const subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: vapidKey });
+  await request("/notifications/push-token", { method: "POST", body: JSON.stringify({ device_id: getDeviceId(), push_token: subscription.endpoint }) });
+}
 
 export type MovementKind = "receipt" | "sale" | "transfer_out" | "transfer_in";
 export type TransferStatus = "requested" | "in_transit" | "received" | "cancelled";
@@ -16,7 +37,7 @@ export interface PurchaseOrderLine { id: string; purchaseOrderId: string; produc
 export interface Notification { id: string; title: string; body: string; kind: string; read: boolean; createdAt: string; }
 export interface Approval { id: string; type: string; subject: string; requester: string; approver: string; priority: string; status: string; deadline?: string | null; isOverdue?: boolean; relatedEntityType?: string | null; relatedEntityId?: string | null; createdAt: string; }
 export interface Expense { id: string; branchId: string; category: string; amount: number; description: string; status: string; createdAt: string; }
-interface OutboxEntry { id?: number; path: string; body: string; queuedAt: string; }
+interface OutboxEntry { id?: number; path: string; body: string; queuedAt: string; attempts: number; }
 
 /** A conflict (409) surfaced by a version-checked action, kept client-side
  * until the operator acknowledges it. Not a full merge UI: the mutation
@@ -68,13 +89,25 @@ export const db = new SpopDatabase();
 
 const localId = () => crypto.randomUUID();
 const timestamp = () => new Date().toISOString();
-async function queue(path: string, body: object) { await db.outbox.add({ path, body: JSON.stringify(body), queuedAt: timestamp() }); }
+const MAX_OUTBOX_ATTEMPTS = 5;
+async function queue(path: string, body: object) { await db.outbox.add({ path, body: JSON.stringify(body), queuedAt: timestamp(), attempts: 0 }); }
 export async function pendingSyncCount() { return db.outbox.count(); }
 async function replayOutbox() {
   const entries = await db.outbox.toArray();
   for (const entry of entries) {
-    await request(entry.path, { method: "POST", body: entry.body });
-    if (entry.id !== undefined) await db.outbox.delete(entry.id);
+    try {
+      await request(entry.path, { method: "POST", body: entry.body });
+      if (entry.id !== undefined) await db.outbox.delete(entry.id);
+    } catch (error) {
+      const attempts = (entry.attempts ?? 0) + 1;
+      if (entry.id === undefined) continue;
+      if (attempts >= MAX_OUTBOX_ATTEMPTS) {
+        await db.outbox.delete(entry.id);
+        await request("/sync/report-failure", { method: "POST", body: JSON.stringify({ path: entry.path, error: error instanceof Error ? error.message : "Unknown error", attempts }) }).catch(() => undefined);
+      } else {
+        await db.outbox.update(entry.id, { attempts });
+      }
+    }
   }
 }
 

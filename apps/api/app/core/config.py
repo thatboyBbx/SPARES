@@ -40,6 +40,16 @@ class Settings(BaseSettings):
     # --- CORS ---
     allowed_origins: list[str] = ["http://localhost:5173"]
 
+    # --- Notifications ---
+    notifications_enabled: bool = True  # kill switch; leave on but unconfigured channels safely no-op
+    firebase_credentials_json: str | None = None  # path to (or raw JSON of) a Firebase service account
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_username: str | None = None
+    smtp_password: str | None = None
+    smtp_sender: str | None = None
+    smtp_recipient: str | None = None
+
 
 @lru_cache
 def get_settings() -> Settings:

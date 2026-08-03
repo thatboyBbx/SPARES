@@ -1,6 +1,6 @@
 import "./index.css";
 import "./App.css";
-import { approveApproval, approveExpense, approvePurchaseOrder, cancelTransfer, createApproval, createCustomer, createExpense, createPurchaseOrder, db, dismissSyncIssue, fetchDailySales, fulfilTransfer, getSyncIssues, loadFromServer, markNotificationRead, pendingSyncCount, receivePurchaseOrder, receiveTransfer, recordReceipt, recordSale, recordTransfer, rejectApproval, rejectExpense, type Approval, type Branch, type Customer, type Expense, type Notification, type Product, type PurchaseOrder, type StockMovement, type Supplier, type Transfer } from "./db/database";
+import { approveApproval, approveExpense, approvePurchaseOrder, cancelTransfer, createApproval, createCustomer, createExpense, createPurchaseOrder, db, dismissSyncIssue, enablePushNotifications, fetchDailySales, fulfilTransfer, getSyncIssues, loadFromServer, markNotificationRead, pendingSyncCount, pushNotificationsAvailable, receivePurchaseOrder, receiveTransfer, recordReceipt, recordSale, recordTransfer, rejectApproval, rejectExpense, type Approval, type Branch, type Customer, type Expense, type Notification, type Product, type PurchaseOrder, type StockMovement, type Supplier, type Transfer } from "./db/database";
 import { getCurrentUser, login, logout, registerDevice, request, type AuthUser } from "./lib/api";
 
 type View = "overview" | "catalogue" | "receipt" | "transfer" | "sale" | "approval" | "expense" | "ledger" | "purchase" | "notifications" | "reports" | "users";
@@ -153,7 +153,7 @@ function content() {
       return `<tr><td>${escape(order.reference)}</td><td>${escape(suppliers.find((supplier) => supplier.id === order.supplierId)?.name ?? order.supplierId)}</td><td>${escape(order.notes)}</td><td><span class="pill">${escape(order.status)}</span></td><td>${action}</td></tr>`;
     }).join("")}</tbody></table></section>`;
   }
-  if (view === "notifications") return `<section class="card table-card"><div class="card-title"><h2>Operator inbox</h2><span>${notifications.filter((item) => !item.read).length} unread</span></div>${notifications.map((item) => `<div class="row"><div><strong>${escape(item.title)}</strong><small>${escape(item.body)}</small></div><div>${item.read ? '<b class="good">Read</b>' : `<button class="secondary mark-read" data-notification-id="${escape(item.id)}">Mark read</button>`}</div></div>`).join("") || "<p>No notifications yet.</p>"}</section>`;
+  if (view === "notifications") return `${pushNotificationsAvailable() ? '<section class="card"><div class="card-title"><h2>Push notifications</h2></div><p>Get alerted the moment stock runs low or a transfer needs attention.</p><button id="enable-push-button" class="secondary">Enable push notifications</button></section>' : ""}<section class="card table-card"><div class="card-title"><h2>Operator inbox</h2><span>${notifications.filter((item) => !item.read).length} unread</span></div>${notifications.map((item) => `<div class="row"><div><strong>${escape(item.title)}</strong><small>${escape(item.body)}</small></div><div>${item.read ? '<b class="good">Read</b>' : `<button class="secondary mark-read" data-notification-id="${escape(item.id)}">Mark read</button>`}</div></div>`).join("") || "<p>No notifications yet.</p>"}</section>`;
   if (view === "reports") return `<section class="card table-card"><div class="card-title"><h2>Daily sales</h2><span>${dailySales.length} days recorded</span></div><table><thead><tr><th>Day</th><th>Sales count</th><th>Sales total</th></tr></thead><tbody>${dailySales.map((row) => `<tr><td>${escape(row.day)}</td><td>${row.sales_count}</td><td>${money.format(row.sales_total)}</td></tr>`).join("") || "<tr><td colspan=\"3\">No sales recorded yet.</td></tr>"}</tbody></table></section>`;
   if (view === "users") return `<section class="form-card"><p class="eyebrow">Access control</p><h2>Create an operator account</h2><form id="user-form" class="form"><label>Full name<input name="full_name" required></label><label>Email<input name="email" type="email" required></label><label>Temporary password<input name="password" type="password" required></label><label>Role<select name="role"><option value="owner">Owner</option><option value="accountant">Accountant</option><option value="store_keeper">Store Keeper</option><option value="shop_manager">Shop Manager</option><option value="cashier" selected>Cashier</option><option value="super_admin">Super Admin</option></select></label><label>Branch<select name="branch"><option value="">Unassigned</option>${options(branches)}</select></label><button class="primary">Create user</button></form></section><section class="card table-card"><div class="card-title"><h2>Operator roster</h2><span>${adminUsers.length} accounts</span></div><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Branch</th><th>Status</th></tr></thead><tbody>${adminUsers.map((item) => `<tr><td>${escape(item.full_name)}</td><td>${escape(item.email)}</td><td><span class="pill">${escape(item.role)}</span></td><td>${escape(branches.find((entry) => entry.id === item.branch_id)?.name ?? "—")}</td><td>${item.is_active ? '<b class="good">Active</b>' : '<b class="danger">Disabled</b>'}</td></tr>`).join("")}</tbody></table></section>`;
   return `<section class="card table-card"><div class="card-title"><h2>Movement evidence</h2><span>Append-only · newest first</span></div><table><thead><tr><th>Time</th><th>Part</th><th>Branch</th><th>Event</th><th>Change</th><th>Reference</th></tr></thead><tbody>${movements.map((item) => `<tr><td>${new Date(item.createdAt).toLocaleString()}</td><td>${escape(product(item.productId)?.name ?? "Part")}</td><td>${escape(branches.find((entry) => entry.id === item.branchId)?.name ?? "Branch")}</td><td><span class="pill">${escape(item.kind.replace("_", " "))}</span></td><td class="${item.quantity > 0 ? "positive" : "negative"}">${item.quantity > 0 ? "+" : ""}${item.quantity}</td><td>${escape(item.reference)}</td></tr>`).join("")}</tbody></table></section>`;
@@ -412,6 +412,15 @@ function bind() {
     view = "notifications";
     render("Notification marked as read.");
   }));
+
+  root.querySelector<HTMLButtonElement>("#enable-push-button")?.addEventListener("click", async () => {
+    try {
+      await enablePushNotifications();
+      render("Push notifications enabled.");
+    } catch (error) {
+      render(error instanceof Error ? error.message : "Could not enable push notifications.");
+    }
+  });
 }
 
 window.addEventListener("online", () => {
