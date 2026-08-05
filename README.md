@@ -5,9 +5,10 @@ spare parts SMEs (1 warehouse + N retail shops). Not a POS — tracks
 inventory movement, transfers, sales recording, purchasing, approvals,
 accounting, and audit trails.
 
-**Status: Phases 1–7 complete.** Phases 8–10 (Accounting, Reports &
-Analytics, AI/Predictive) are not started. See `PHASED_PLAN.md` for the
-full roadmap and phase definitions.
+**Status: Phases 1–10 complete.** Phase 10 ships a heuristic v1 (trailing
+sales velocity, not machine learning) rather than real demand forecasting
+— see `PHASED_PLAN.md` for why that stays deferred until there's real
+production data to validate a model against.
 
 ## Current MVP
 
@@ -39,6 +40,21 @@ full roadmap and phase definitions.
   email by default, SMTP and Firebase Cloud Messaging when configured),
   low-stock alerts fired only on the movement that crosses the reorder
   threshold, and a sync-failure reporting endpoint for the offline outbox.
+- **Phase 8 — Accounting**: supplier payments (optionally linked to a
+  purchase order) and an append-only `journal_entries` ledger — the same
+  never-a-mutable-balance discipline as stock — posted automatically from
+  sale, expense approval, purchase-order receive, and supplier payment.
+- **Phase 9 — Reports & Analytics**: accrual-basis profit & loss,
+  per-branch performance (sales, stock value, low-stock count), expenses
+  grouped by category/status, and an approvals bottleneck summary (pending,
+  overdue, average resolution time) alongside the existing stock-health and
+  daily-sales views.
+- **Phase 10 — AI / Predictive (heuristic foundation)**: reorder
+  suggestions from trailing 30-day sales velocity projected against current
+  stock — a deterministic, explainable v1, not machine learning. Real
+  demand forecasting stays deferred per this phase's own rationale until
+  Phases 1-9 have produced real production data to validate a model
+  against.
 
 Sample records live in `apps/api/app/data/sample_data.json` and are
 inserted only into an empty database; no sample business records are
@@ -107,7 +123,8 @@ Replace all pilot accounts before any real deployment.
 - `GET/POST /api/v1/customers`.
 - `POST /api/v1/approvals`, `/approvals/{id}/approve|reject`; `POST /expenses`, `/expenses/{id}/approve|reject`.
 - `GET /api/v1/notifications`; `POST /notifications/push-token`; `POST /sync/report-failure`.
-- `GET /api/v1/reports/overview` and `/reports/daily-sales` return owner metrics, branch stock, and sales aggregates.
+- `POST /api/v1/supplier-payments`, `GET /supplier-payments`; `GET /api/v1/journal`.
+- `GET /api/v1/reports/overview`, `/reports/daily-sales`, `/reports/profit-loss`, `/reports/branch-performance`, `/reports/expenses-summary`, `/reports/approvals-summary`, and `/reports/replenishment-suggestions` return owner/accountant/shop-manager metrics, branch stock, sales, financial, and reorder-heuristic data.
 
 ### Running without Docker
 

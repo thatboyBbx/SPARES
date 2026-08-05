@@ -164,6 +164,39 @@ class Expense(SyncedEntityMixin, Base):
     idempotency_key: Mapped[str | None] = mapped_column(String(80), unique=True, nullable=True)
 
 
+class SupplierPayment(SyncedEntityMixin, Base):
+    """A payment made to a supplier, optionally against a specific purchase
+    order. Posts a matching outflow JournalEntry so accounting stays a
+    derived view of ledger events, the same discipline stock balances use."""
+    __tablename__ = "supplier_payments"
+    reference: Mapped[str] = mapped_column(String(80), unique=True)
+    supplier_id: Mapped[str] = mapped_column(ForeignKey("suppliers.id"), index=True)
+    purchase_order_id: Mapped[str | None] = mapped_column(ForeignKey("purchase_orders.id"), nullable=True, index=True)
+    amount: Mapped[float] = mapped_column(Float)
+    method: Mapped[str] = mapped_column(String(30), default="bank")
+    notes: Mapped[str] = mapped_column(Text, default="")
+    idempotency_key: Mapped[str | None] = mapped_column(String(80), unique=True, nullable=True)
+
+
+class JournalEntry(Base):
+    """Append-only financial ledger, mirroring the StockMovement pattern:
+    never a mutable balance, only signed entries (+inflow / -outflow) that
+    reports sum over. Posted automatically from sale/expense-approval/
+    purchase-receive/supplier-payment — never written directly by a client."""
+    __tablename__ = "journal_entries"
+    __table_args__ = (Index("ix_journal_entries_type_created", "entry_type", "created_at"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    entry_type: Mapped[str] = mapped_column(String(30), index=True)  # sale_revenue, expense, purchase_cost, supplier_payment
+    amount: Mapped[float] = mapped_column(Float)
+    branch_id: Mapped[str | None] = mapped_column(ForeignKey("branches.id"), nullable=True, index=True)
+    reference: Mapped[str] = mapped_column(String(80), index=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    related_entity_type: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
+    related_entity_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    created_by: Mapped[str] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
 class Notification(Base):
     __tablename__ = "notifications"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
