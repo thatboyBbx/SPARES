@@ -1,6 +1,8 @@
 """Database-backed API for the SparePilot operating MVP."""
+import math
+from collections import Counter
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Annotated
 from uuid import uuid4
 
@@ -13,10 +15,10 @@ from sqlalchemy.orm import Session
 from app.core.auth import create_access_token, create_refresh_token, get_current_user, hash_password, require_roles, revoke_refresh_token, rotate_refresh_token, verify_and_upgrade_password
 from app.core.config import get_settings
 from app.core.notifications import dispatch_notification
-from app.core.permissions import CAN_APPROVE, CAN_FULFIL_TRANSFER, CAN_MANAGE_STOCK_RECEIPTS, CAN_MANAGE_USERS, CAN_RECEIVE_TRANSFER, CAN_RECORD_SALE, CAN_REQUEST_TRANSFER
+from app.core.permissions import CAN_APPROVE, CAN_FULFIL_TRANSFER, CAN_MANAGE_ACCOUNTING, CAN_MANAGE_STOCK_RECEIPTS, CAN_MANAGE_USERS, CAN_RECEIVE_TRANSFER, CAN_RECORD_SALE, CAN_REQUEST_PURCHASE, CAN_REQUEST_TRANSFER, CAN_VIEW_ANALYTICS
 from app.db.base import Base, SyncStatus, as_aware_utc
 from app.db.session import engine, get_db
-from app.models import Approval, Branch, Category, Customer, Device, Expense, Notification, Product, PurchaseOrder, PurchaseOrderLine, PurchaseReceipt, Sale, StockMovement, Supplier, Transfer, User, UserRole
+from app.models import Approval, Branch, Category, Customer, Device, Expense, JournalEntry, Notification, Product, PurchaseOrder, PurchaseOrderLine, PurchaseReceipt, Sale, StockMovement, Supplier, SupplierPayment, Transfer, User, UserRole
 from app.seed import seed_database
 
 # Sentinel for mixin-backed rows written by a plain HTTP request rather than
@@ -115,6 +117,15 @@ class ExpenseIn(BaseModel):
     client_request_id: str | None = None
 
 
+class SupplierPaymentIn(BaseModel):
+    supplier_id: str
+    purchase_order_id: str | None = None
+    amount: float = Field(gt=0)
+    method: str = "bank"
+    notes: str = ""
+    client_request_id: str | None = None
+
+
 class VersionedActionIn(BaseModel):
     expected_version: int
 
@@ -182,6 +193,27 @@ def notify_if_crossing_low_stock(db: Session, product: Product, branch_id: str, 
     previous = current - movement_quantity
     if previous >= product.reorder_level and current < product.reorder_level:
         dispatch_notification(db, title=f"Low stock: {product.name}", body=f"{product.name} is at {current} units at this branch (reorder level {product.reorder_level}).", kind="low_stock")
+
+def post_journal_entry(
+    db: Session,
+    *,
+    entry_type: str,
+    amount: float,
+    reference: str,
+    actor: str,
+    description: str = "",
+    branch_id: str | None = None,
+    related_entity_type: str | None = None,
+    related_entity_id: str | None = None,
+) -> JournalEntry:
+    """Single write path for the accounting ledger — sale revenue, approved
+    expenses, purchase cost on receive, and supplier payments all post here
+    so financial reports stay a derived SUM() over signed entries, the same
+    discipline branch_stock() already applies to StockMovement."""
+    entry = JournalEntry(entry_type=entry_type, amount=amount, reference=reference, description=description, branch_id=branch_id, related_entity_type=related_entity_type, related_entity_id=related_entity_id, created_by=actor)
+    db.add(entry)
+    return entry
+
 
 def require(db: Session, model: type, identity: str):
     record = db.get(model, identity)
@@ -282,12 +314,12 @@ def health_check() -> dict[str, str]:
 @app.get("/api/v1/bootstrap")
 def bootstrap(
     db: Session = Depends(get_db),
-    _: Annotated[User, Depends(get_current_user)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None,
 ) -> dict:
     products = db.scalars(select(Product).order_by(Product.name)).all()
     branches = db.scalars(select(Branch).order_by(Branch.kind)).all()
     movements = db.scalars(select(StockMovement).order_by(StockMovement.created_at.desc())).all()
-    return {"users": [serialize(u) for u in db.scalars(select(User)).all()], "products": [serialize(p) for p in products], "categories": [serialize(c) for c in db.scalars(select(Category).order_by(Category.name)).all()], "branches": [serialize(b) for b in branches], "suppliers": [serialize(s) for s in db.scalars(select(Supplier)).all()], "customers": [serialize(c) for c in db.scalars(select(Customer).order_by(Customer.name)).all()], "movements": [serialize(m) for m in movements], "transfers": [serialize(t) for t in db.scalars(select(Transfer).order_by(Transfer.created_at.desc())).all()], "sales": [serialize(s) for s in db.scalars(select(Sale).order_by(Sale.created_at.desc())).all()], "purchase_orders": [serialize(o) for o in db.scalars(select(PurchaseOrder).order_by(PurchaseOrder.requested_at.desc())).all()], "purchase_order_lines": [serialize(l) for l in db.scalars(select(PurchaseOrderLine).order_by(PurchaseOrderLine.created_at.desc())).all()], "approvals": [serialize_approval(a) for a in db.scalars(select(Approval).order_by(Approval.created_at.desc())).all()], "expenses": [serialize(e) for e in db.scalars(select(Expense).order_by(Expense.created_at.desc())).all()], "notifications": [serialize(n) for n in db.scalars(select(Notification).order_by(Notification.created_at.desc())).all()]}
+    return {"users": [serialize(u) for u in db.scalars(select(User)).all()], "products": [serialize(p) for p in products], "categories": [serialize(c) for c in db.scalars(select(Category).order_by(Category.name)).all()], "branches": [serialize(b) for b in branches], "suppliers": [serialize(s) for s in db.scalars(select(Supplier)).all()], "customers": [serialize(c) for c in db.scalars(select(Customer).order_by(Customer.name)).all()], "movements": [serialize(m) for m in movements], "transfers": [serialize(t) for t in db.scalars(select(Transfer).order_by(Transfer.created_at.desc())).all()], "sales": [serialize(s) for s in db.scalars(select(Sale).order_by(Sale.created_at.desc())).all()], "purchase_orders": [serialize(o) for o in db.scalars(select(PurchaseOrder).order_by(PurchaseOrder.requested_at.desc())).all()], "purchase_order_lines": [serialize(l) for l in db.scalars(select(PurchaseOrderLine).order_by(PurchaseOrderLine.created_at.desc())).all()], "approvals": [serialize_approval(a) for a in db.scalars(select(Approval).order_by(Approval.created_at.desc())).all()], "expenses": [serialize(e) for e in db.scalars(select(Expense).order_by(Expense.created_at.desc())).all()], "notifications": [serialize(n) for n in db.scalars(select(Notification).order_by(Notification.created_at.desc())).all()], "supplier_payments": [serialize(p) for p in db.scalars(select(SupplierPayment).order_by(SupplierPayment.created_at.desc())).all()] if current_user.role in CAN_MANAGE_ACCOUNTING else [], "journal_entries": [serialize(j) for j in db.scalars(select(JournalEntry).order_by(JournalEntry.created_at.desc())).all()] if current_user.role in CAN_MANAGE_ACCOUNTING else []}
 
 @app.post("/api/v1/auth/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)) -> dict:
@@ -497,6 +529,7 @@ def receive_purchase_order(
     if not lines:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Purchase order has no lines")
 
+    total_cost = 0.0
     for line in lines:
         require(db, Product, line.product_id)
         require(db, Branch, order.branch_id)
@@ -507,9 +540,12 @@ def receive_purchase_order(
         receipt_idempotency_key = f"po-receive-{order.id}-{line.id}"
         db.add(PurchaseReceipt(reference=receipt_reference, supplier_id=order.supplier_id, branch_id=order.branch_id, product_id=line.product_id, quantity=line.quantity, idempotency_key=receipt_idempotency_key, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id))
         db.add(StockMovement(product_id=line.product_id, branch_id=order.branch_id, quantity=line.quantity, kind="receipt", reference=receipt_reference, created_by=current_user.full_name, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id))
+        total_cost += line.quantity * line.unit_cost
 
     order.status = "received"
     order.received_at = datetime.now(timezone.utc)
+    if total_cost:
+        post_journal_entry(db, entry_type="purchase_cost", amount=-total_cost, reference=order.reference, actor=current_user.full_name, description=f"Goods received for {order.reference}", branch_id=order.branch_id, related_entity_type="purchase_order", related_entity_id=order.id)
     dispatch_notification(db, title="Goods received", body=f"{order.reference} completed and posted to stock.", kind="purchase_order")
     db.commit()
     return {"reference": order.reference, "received_lines": len(lines), "version": order.version, "message": "Purchase order received"}
@@ -690,7 +726,11 @@ def create_sale(
     if branch_stock(db, payload.product_id, payload.branch_id) < payload.quantity: raise HTTPException(422, "Insufficient branch stock")
     ref = reference("S")
     total = product.selling_price * payload.quantity
-    db.add(Sale(receipt_number=ref, product_id=payload.product_id, branch_id=payload.branch_id, customer_id=payload.customer_id, quantity=payload.quantity, total=total, idempotency_key=payload.client_request_id, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)); db.add(StockMovement(product_id=payload.product_id, branch_id=payload.branch_id, quantity=-payload.quantity, kind="sale", reference=ref, created_by=current_user.full_name, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id))
+    sale = Sale(receipt_number=ref, product_id=payload.product_id, branch_id=payload.branch_id, customer_id=payload.customer_id, quantity=payload.quantity, total=total, idempotency_key=payload.client_request_id, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)
+    db.add(sale)
+    db.add(StockMovement(product_id=payload.product_id, branch_id=payload.branch_id, quantity=-payload.quantity, kind="sale", reference=ref, created_by=current_user.full_name, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id))
+    db.flush()
+    post_journal_entry(db, entry_type="sale_revenue", amount=total, reference=ref, actor=current_user.full_name, description=f"Sale {ref} ({payload.quantity}x {product.name})", branch_id=payload.branch_id, related_entity_type="sale", related_entity_id=sale.id)
     notify_if_crossing_low_stock(db, product, payload.branch_id, -payload.quantity)
     db.commit()
     return {"receipt_number": ref, "total": total, "message": "Sale recorded"}
@@ -798,6 +838,7 @@ def approve_expense(
     expense = require(db, Expense, expense_id)
     approval = find_linked_approval(db, "expense", expense_id)
     dispatch_approval_decision(db, approval, "approved", current_user)
+    post_journal_entry(db, entry_type="expense", amount=-expense.amount, reference=f"EXP-{expense.id[:8]}", actor=current_user.full_name, description=expense.description, branch_id=expense.branch_id, related_entity_type="expense", related_entity_id=expense.id)
     db.commit()
     return serialize(expense)
 
@@ -814,6 +855,55 @@ def reject_expense(
     dispatch_approval_decision(db, approval, "rejected", current_user)
     db.commit()
     return serialize(expense)
+
+
+@app.post("/api/v1/supplier-payments", status_code=201)
+def create_supplier_payment(
+    payload: SupplierPaymentIn,
+    db: Session = Depends(get_db),
+    current_user: Annotated[User, Depends(require_roles(*CAN_MANAGE_ACCOUNTING))] = None,
+) -> dict:
+    if payload.client_request_id:
+        existing = db.scalar(select(SupplierPayment).where(SupplierPayment.idempotency_key == payload.client_request_id))
+        if existing: return {"reference": existing.reference, "message": "Supplier payment already recorded"}
+    supplier = require(db, Supplier, payload.supplier_id)
+    order = require(db, PurchaseOrder, payload.purchase_order_id) if payload.purchase_order_id else None
+    if order and order.supplier_id != supplier.id:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Purchase order does not belong to this supplier")
+    ref = reference("PAY")
+    payment = SupplierPayment(reference=ref, supplier_id=supplier.id, purchase_order_id=order.id if order else None, amount=payload.amount, method=payload.method, notes=payload.notes, idempotency_key=payload.client_request_id, device_id=SERVER_DEVICE_ID, created_by_id=current_user.id)
+    db.add(payment)
+    db.flush()
+    post_journal_entry(db, entry_type="supplier_payment", amount=-payload.amount, reference=ref, actor=current_user.full_name, description=f"Payment to {supplier.name}" + (f" for {order.reference}" if order else ""), branch_id=order.branch_id if order else None, related_entity_type="supplier_payment", related_entity_id=payment.id)
+    db.commit()
+    return {"reference": ref, "message": "Supplier payment recorded"}
+
+
+@app.get("/api/v1/supplier-payments")
+def list_supplier_payments(
+    supplier_id: str | None = None,
+    db: Session = Depends(get_db),
+    _: Annotated[User, Depends(require_roles(*CAN_MANAGE_ACCOUNTING))] = None,
+) -> list[dict]:
+    query = select(SupplierPayment)
+    if supplier_id:
+        query = query.where(SupplierPayment.supplier_id == supplier_id)
+    return [serialize(payment) for payment in db.scalars(query.order_by(SupplierPayment.created_at.desc())).all()]
+
+
+@app.get("/api/v1/journal")
+def list_journal_entries(
+    entry_type: str | None = None,
+    branch_id: str | None = None,
+    db: Session = Depends(get_db),
+    _: Annotated[User, Depends(require_roles(*CAN_MANAGE_ACCOUNTING))] = None,
+) -> list[dict]:
+    query = select(JournalEntry)
+    if entry_type:
+        query = query.where(JournalEntry.entry_type == entry_type)
+    if branch_id:
+        query = query.where(JournalEntry.branch_id == branch_id)
+    return [serialize(entry) for entry in db.scalars(query.order_by(JournalEntry.created_at.desc())).all()]
 
 
 @app.get("/api/v1/notifications")
@@ -895,6 +985,153 @@ def daily_sales(
         select(func.date(Sale.created_at), func.count(Sale.id), func.coalesce(func.sum(Sale.total), 0.0)).group_by(func.date(Sale.created_at)).order_by(func.date(Sale.created_at))
     ).all()
     return [{"day": day, "sales_count": int(count), "sales_total": float(total)} for day, count, total in rows]
+
+
+@app.get("/api/v1/reports/profit-loss")
+def profit_loss(
+    start: date | None = None,
+    end: date | None = None,
+    db: Session = Depends(get_db),
+    _: Annotated[User, Depends(require_roles(*CAN_MANAGE_ACCOUNTING))] = None,
+) -> dict:
+    """Accrual-basis P&L derived from the journal: revenue is recognised at
+    sale, purchase_cost at goods-received (not at cash payment) — so
+    supplier_payments is reported separately as a cash-flow figure and is
+    deliberately NOT subtracted again here, to avoid double-counting the
+    same spend on both a cash and an accrual basis."""
+    query = select(JournalEntry.entry_type, func.coalesce(func.sum(JournalEntry.amount), 0.0)).group_by(JournalEntry.entry_type)
+    if start:
+        query = query.where(JournalEntry.created_at >= datetime.combine(start, time.min, tzinfo=timezone.utc))
+    if end:
+        query = query.where(JournalEntry.created_at <= datetime.combine(end, time.max, tzinfo=timezone.utc))
+    totals = {entry_type: float(total) for entry_type, total in db.execute(query).all()}
+    revenue = totals.get("sale_revenue", 0.0)
+    purchase_cost = -totals.get("purchase_cost", 0.0)
+    expenses = -totals.get("expense", 0.0)
+    supplier_payments_cash_out = -totals.get("supplier_payment", 0.0)
+    return {
+        "start": start.isoformat() if start else None,
+        "end": end.isoformat() if end else None,
+        "revenue": revenue,
+        "purchase_cost": purchase_cost,
+        "expenses": expenses,
+        "net_profit": revenue - purchase_cost - expenses,
+        "supplier_payments_cash_out": supplier_payments_cash_out,
+    }
+
+
+@app.get("/api/v1/reports/branch-performance")
+def branch_performance(
+    db: Session = Depends(get_db),
+    _: Annotated[User, Depends(require_roles(*CAN_VIEW_ANALYTICS))] = None,
+) -> list[dict]:
+    branches = db.scalars(select(Branch).order_by(Branch.kind)).all()
+    products = db.scalars(select(Product)).all()
+    rows = []
+    for b in branches:
+        sales_total, sales_count = db.execute(select(func.coalesce(func.sum(Sale.total), 0.0), func.count(Sale.id)).where(Sale.branch_id == b.id)).one()
+        stock_levels = {p.id: branch_stock(db, p.id, b.id) for p in products}
+        stock_value = sum(stock_levels[p.id] * p.selling_price for p in products)
+        low_stock_count = sum(1 for p in products if stock_levels[p.id] <= p.reorder_level)
+        rows.append({
+            "branch_id": b.id,
+            "branch_name": b.name,
+            "sales_total": float(sales_total),
+            "sales_count": int(sales_count),
+            "stock_value": stock_value,
+            "low_stock_count": low_stock_count,
+        })
+    return rows
+
+
+@app.get("/api/v1/reports/expenses-summary")
+def expenses_summary(
+    db: Session = Depends(get_db),
+    _: Annotated[User, Depends(require_roles(*CAN_MANAGE_ACCOUNTING))] = None,
+) -> dict:
+    rows = db.execute(
+        select(Expense.category, Expense.status, func.count(Expense.id), func.coalesce(func.sum(Expense.amount), 0.0))
+        .group_by(Expense.category, Expense.status)
+        .order_by(Expense.category)
+    ).all()
+    by_category = [{"category": category, "status": status_, "count": int(count), "total": float(total)} for category, status_, count, total in rows]
+    return {
+        "by_category": by_category,
+        "total_approved": sum(row["total"] for row in by_category if row["status"] == "approved"),
+        "total_pending": sum(row["total"] for row in by_category if row["status"] == "pending"),
+    }
+
+
+@app.get("/api/v1/reports/approvals-summary")
+def approvals_summary(
+    db: Session = Depends(get_db),
+    _: Annotated[User, Depends(require_roles(*CAN_VIEW_ANALYTICS))] = None,
+) -> dict:
+    escalate_overdue_approvals(db)
+    approvals = db.scalars(select(Approval)).all()
+    pending = [a for a in approvals if a.status == "pending"]
+    resolved = [a for a in approvals if a.status in ("approved", "rejected")]
+    overdue = [a for a in pending if a.deadline and as_aware_utc(a.deadline) < datetime.now(timezone.utc)]
+    resolution_hours = [(as_aware_utc(a.updated_at) - as_aware_utc(a.created_at)).total_seconds() / 3600 for a in resolved]
+    return {
+        "pending_count": len(pending),
+        "overdue_count": len(overdue),
+        "pending_by_type": dict(Counter(a.type for a in pending)),
+        "avg_resolution_hours": (sum(resolution_hours) / len(resolution_hours)) if resolution_hours else None,
+    }
+
+
+REPLENISHMENT_WINDOW_DAYS = 30
+REPLENISHMENT_TARGET_COVER_DAYS = 30
+REPLENISHMENT_URGENT_COVER_DAYS = 7
+
+
+@app.get("/api/v1/reports/replenishment-suggestions")
+def replenishment_suggestions(
+    db: Session = Depends(get_db),
+    _: Annotated[User, Depends(require_roles(*CAN_REQUEST_PURCHASE))] = None,
+) -> list[dict]:
+    """Phase 10 foundation: a deterministic, fully-explainable heuristic —
+    trailing sales velocity projected against current stock — not machine
+    learning. PHASED_PLAN.md deliberately defers real demand
+    forecasting/ML until Phases 1-9 have produced enough real production
+    data to validate a model against; this gives Owner/Store Keeper/Shop
+    Manager an actionable reorder signal in the meantime, upgradeable to a
+    real model later without changing the response shape callers depend on.
+    """
+    window_start = datetime.now(timezone.utc) - timedelta(days=REPLENISHMENT_WINDOW_DAYS)
+    products = db.scalars(select(Product).order_by(Product.name)).all()
+    branches = db.scalars(select(Branch).order_by(Branch.kind)).all()
+    suggestions = []
+    for product in products:
+        for branch in branches:
+            current_stock = branch_stock(db, product.id, branch.id)
+            sold = int(db.scalar(select(func.coalesce(func.sum(Sale.quantity), 0)).where(Sale.product_id == product.id, Sale.branch_id == branch.id, Sale.created_at >= window_start)) or 0)
+            velocity_per_day = sold / REPLENISHMENT_WINDOW_DAYS
+            days_of_cover = (current_stock / velocity_per_day) if velocity_per_day > 0 else None
+            needs_reorder = current_stock <= product.reorder_level
+            urgent = needs_reorder or (days_of_cover is not None and days_of_cover < REPLENISHMENT_URGENT_COVER_DAYS)
+            if velocity_per_day > 0:
+                suggested_quantity = max(0, math.ceil(velocity_per_day * REPLENISHMENT_TARGET_COVER_DAYS - current_stock))
+            elif needs_reorder:
+                suggested_quantity = max(0, product.reorder_level * 2 - current_stock)
+            else:
+                suggested_quantity = 0
+            suggestions.append({
+                "product_id": product.id,
+                "product_name": product.name,
+                "branch_id": branch.id,
+                "branch_name": branch.name,
+                "current_stock": current_stock,
+                "reorder_level": product.reorder_level,
+                "sales_last_30_days": sold,
+                "velocity_per_day": round(velocity_per_day, 3),
+                "days_of_cover": round(days_of_cover, 1) if days_of_cover is not None else None,
+                "needs_reorder": needs_reorder,
+                "urgent": urgent,
+                "suggested_reorder_quantity": suggested_quantity,
+            })
+    return suggestions
 
 
 def serialize(record: object) -> dict:

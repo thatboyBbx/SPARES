@@ -43,14 +43,26 @@ changes, with escalation rules.
 FCM push (approvals, low stock, failed sync, transfer confirmations),
 email fallback.
 
-## Phase 8 — Accounting
+## Phase 8 — Accounting ✅
 Expenses, supplier payments, journals — deliberately last, depends on
-stable sales + purchasing data.
+stable sales + purchasing data. A single append-only `journal_entries`
+ledger (signed amounts, same discipline as the stock ledger) is posted to
+automatically from sale, expense-approval, purchase-order-receive, and
+supplier-payment — never written directly by a client.
 
-## Phase 9 — Reports & Analytics
-Owner/Shop Manager dashboards built as literal answers to the 8 success-
-criteria questions in the system summary doc.
+## Phase 9 — Reports & Analytics ✅
+Owner/Shop Manager dashboards built as literal answers to the operating
+questions an owner actually asks: what did we make (profit-and-loss),
+which branches are pulling their weight (branch performance), what are we
+spending on (expenses summary), and where are approvals stuck
+(approvals-summary, alongside the existing stock-health and daily-sales
+views).
 
-## Phase 10 — AI / Predictive (deferred)
-Replenishment prediction, demand forecasting. Not started until Phases
-1-9 have real production data to validate against.
+## Phase 10 — AI / Predictive (heuristic foundation shipped; real ML still deferred)
+Replenishment prediction, demand forecasting. This phase's own rationale
+was to wait for real production data before fitting a model — that still
+holds, so no ML/forecasting library was introduced. What shipped instead
+is a deterministic, fully-explainable v1: trailing 30-day sales velocity
+projected against current stock, surfaced at
+`/api/v1/reports/replenishment-suggestions`. It's upgradeable to a real
+model later without changing the response shape callers depend on.

@@ -37,6 +37,8 @@ export interface PurchaseOrderLine { id: string; purchaseOrderId: string; produc
 export interface Notification { id: string; title: string; body: string; kind: string; read: boolean; createdAt: string; }
 export interface Approval { id: string; type: string; subject: string; requester: string; approver: string; priority: string; status: string; deadline?: string | null; isOverdue?: boolean; relatedEntityType?: string | null; relatedEntityId?: string | null; createdAt: string; }
 export interface Expense { id: string; branchId: string; category: string; amount: number; description: string; status: string; createdAt: string; }
+export interface SupplierPayment { id: string; reference: string; supplierId: string; purchaseOrderId?: string | null; amount: number; method: string; notes: string; createdAt: string; }
+export interface JournalEntry { id: string; entryType: string; amount: number; branchId?: string | null; reference: string; description: string; relatedEntityType?: string | null; relatedEntityId?: string | null; createdBy: string; createdAt: string; }
 interface OutboxEntry { id?: number; path: string; body: string; queuedAt: string; attempts: number; }
 
 /** A conflict (409) surfaced by a version-checked action, kept client-side
@@ -63,6 +65,8 @@ class SpopDatabase extends Dexie {
   notifications!: Table<Notification, string>;
   approvals!: Table<Approval, string>;
   expenses!: Table<Expense, string>;
+  supplierPayments!: Table<SupplierPayment, string>;
+  journalEntries!: Table<JournalEntry, string>;
   outbox!: Table<OutboxEntry, number>;
 
   constructor() {
@@ -82,6 +86,10 @@ class SpopDatabase extends Dexie {
       approvals: "id, status",
       expenses: "id, status",
       outbox: "++id",
+    });
+    this.version(2).stores({
+      supplierPayments: "id, supplierId, createdAt",
+      journalEntries: "id, entryType, createdAt",
     });
   }
 }
@@ -127,9 +135,11 @@ export async function loadFromServer() {
     approvals: Array<{ id: string; type: string; subject: string; requester: string; approver: string; priority: string; status: string; deadline?: string | null; is_overdue?: boolean; related_entity_type?: string | null; related_entity_id?: string | null; created_at: string }>;
     expenses: Array<{ id: string; branch_id: string; category: string; amount: number; description: string; status: string; created_at: string }>;
     notifications: Array<{ id: string; title: string; body: string; kind: string; read: boolean; created_at: string }>;
+    supplier_payments: Array<{ id: string; reference: string; supplier_id: string; purchase_order_id: string | null; amount: number; method: string; notes: string; created_at: string }>;
+    journal_entries: Array<{ id: string; entry_type: string; amount: number; branch_id: string | null; reference: string; description: string; related_entity_type: string | null; related_entity_id: string | null; created_by: string; created_at: string }>;
   };
-  await db.transaction("rw", [db.branches, db.products, db.categories, db.suppliers, db.customers, db.movements, db.transfers, db.sales, db.purchaseOrders, db.purchaseOrderLines, db.notifications, db.approvals, db.expenses], async () => {
-    await Promise.all([db.branches.clear(), db.products.clear(), db.categories.clear(), db.suppliers.clear(), db.customers.clear(), db.movements.clear(), db.transfers.clear(), db.sales.clear(), db.purchaseOrders.clear(), db.purchaseOrderLines.clear(), db.notifications.clear(), db.approvals.clear(), db.expenses.clear()]);
+  await db.transaction("rw", [db.branches, db.products, db.categories, db.suppliers, db.customers, db.movements, db.transfers, db.sales, db.purchaseOrders, db.purchaseOrderLines, db.notifications, db.approvals, db.expenses, db.supplierPayments, db.journalEntries], async () => {
+    await Promise.all([db.branches.clear(), db.products.clear(), db.categories.clear(), db.suppliers.clear(), db.customers.clear(), db.movements.clear(), db.transfers.clear(), db.sales.clear(), db.purchaseOrders.clear(), db.purchaseOrderLines.clear(), db.notifications.clear(), db.approvals.clear(), db.expenses.clear(), db.supplierPayments.clear(), db.journalEntries.clear()]);
     await db.branches.bulkPut(data.branches.map((b) => ({ id: b.id, name: b.name, type: b.kind })));
     await db.products.bulkPut(data.products.map((p) => ({ id: p.id, sku: p.sku, name: p.name, brand: p.brand, fitment: p.fitment, reorderLevel: p.reorder_level, sellingPrice: p.selling_price, categoryId: p.category_id })));
     await db.categories.bulkPut(data.categories.map((c) => ({ id: c.id, name: c.name, parentId: c.parent_id })));
@@ -143,6 +153,8 @@ export async function loadFromServer() {
     await db.approvals.bulkPut(data.approvals.map((approval) => ({ id: approval.id, type: approval.type, subject: approval.subject, requester: approval.requester, approver: approval.approver, priority: approval.priority, status: approval.status, deadline: approval.deadline, isOverdue: approval.is_overdue, relatedEntityType: approval.related_entity_type, relatedEntityId: approval.related_entity_id, createdAt: approval.created_at })));
     await db.expenses.bulkPut(data.expenses.map((expense) => ({ id: expense.id, branchId: expense.branch_id, category: expense.category, amount: expense.amount, description: expense.description, status: expense.status, createdAt: expense.created_at })));
     await db.notifications.bulkPut(data.notifications.map((notification) => ({ id: notification.id, title: notification.title, body: notification.body, kind: notification.kind, read: notification.read, createdAt: notification.created_at })));
+    await db.supplierPayments.bulkPut(data.supplier_payments.map((payment) => ({ id: payment.id, reference: payment.reference, supplierId: payment.supplier_id, purchaseOrderId: payment.purchase_order_id, amount: payment.amount, method: payment.method, notes: payment.notes, createdAt: payment.created_at })));
+    await db.journalEntries.bulkPut(data.journal_entries.map((entry) => ({ id: entry.id, entryType: entry.entry_type, amount: entry.amount, branchId: entry.branch_id, reference: entry.reference, description: entry.description, relatedEntityType: entry.related_entity_type, relatedEntityId: entry.related_entity_id, createdBy: entry.created_by, createdAt: entry.created_at })));
   });
 }
 export async function recordReceipt(productId: string, branchId: string, quantity: number, supplierId: string) {
@@ -220,3 +232,17 @@ export async function markNotificationRead(notificationId: string) {
   try { await request(`/notifications/${notificationId}/read`, { method: "POST" }); await loadFromServer(); }
   catch { /* keep cached state */ }
 }
+export async function createSupplierPayment(supplierId: string, purchaseOrderId: string | null, amount: number, method: string, notes: string) {
+  await request("/supplier-payments", { method: "POST", body: JSON.stringify({ supplier_id: supplierId, purchase_order_id: purchaseOrderId || null, amount, method, notes, client_request_id: localId() }) });
+  await loadFromServer();
+}
+export interface ProfitLoss { start: string | null; end: string | null; revenue: number; purchase_cost: number; expenses: number; net_profit: number; supplier_payments_cash_out: number; }
+export async function fetchProfitLoss(): Promise<ProfitLoss> { return (await request("/reports/profit-loss")) as ProfitLoss; }
+export interface BranchPerformance { branch_id: string; branch_name: string; sales_total: number; sales_count: number; stock_value: number; low_stock_count: number; }
+export async function fetchBranchPerformance(): Promise<BranchPerformance[]> { return (await request("/reports/branch-performance")) as BranchPerformance[]; }
+export interface ExpensesSummary { by_category: Array<{ category: string; status: string; count: number; total: number }>; total_approved: number; total_pending: number; }
+export async function fetchExpensesSummary(): Promise<ExpensesSummary> { return (await request("/reports/expenses-summary")) as ExpensesSummary; }
+export interface ApprovalsSummary { pending_count: number; overdue_count: number; pending_by_type: Record<string, number>; avg_resolution_hours: number | null; }
+export async function fetchApprovalsSummary(): Promise<ApprovalsSummary> { return (await request("/reports/approvals-summary")) as ApprovalsSummary; }
+export interface ReplenishmentSuggestion { product_id: string; product_name: string; branch_id: string; branch_name: string; current_stock: number; reorder_level: number; sales_last_30_days: number; velocity_per_day: number; days_of_cover: number | null; needs_reorder: boolean; urgent: boolean; suggested_reorder_quantity: number; }
+export async function fetchReplenishmentSuggestions(): Promise<ReplenishmentSuggestion[]> { return (await request("/reports/replenishment-suggestions")) as ReplenishmentSuggestion[]; }
