@@ -12,6 +12,9 @@ from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+PILOT_PASSWORD = "pilot123"
+
+
 class Settings(BaseSettings):
     """
     Typed application settings. Each field maps to an environment variable
@@ -49,6 +52,22 @@ class Settings(BaseSettings):
     smtp_password: str | None = None
     smtp_sender: str | None = None
     smtp_recipient: str | None = None
+
+    def assert_deployable(self) -> None:
+        """Reject settings that are safe for a laptop but unsafe for production."""
+        if self.environment != "production":
+            return
+        problems: list[str] = []
+        if self.debug:
+            problems.append("DEBUG must be false")
+        if self.jwt_secret_key in {"change-me-in-production", "local-dev-secret-do-not-use-in-production"} or len(self.jwt_secret_key) < 32:
+            problems.append("JWT_SECRET_KEY must be a unique value of at least 32 characters")
+        if "localhost" in self.database_url or "@postgres:" in self.database_url:
+            problems.append("DATABASE_URL must point to the production database")
+        if not self.allowed_origins or any("localhost" in origin for origin in self.allowed_origins):
+            problems.append("ALLOWED_ORIGINS must contain only deployed application origins")
+        if problems:
+            raise RuntimeError("Unsafe production configuration: " + "; ".join(problems))
 
 
 @lru_cache

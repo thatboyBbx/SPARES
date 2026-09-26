@@ -203,6 +203,7 @@ function form(heading: string, id: string, fields: string, action: string) {
 
 function renderLogin(message = "") {
   root.innerHTML = `<main class="shell auth-shell"><section class="card auth-card"><p class="eyebrow">Secure operator sign-in</p><h1>Access the spare parts control room</h1><p>Sign in with your pilot credentials to load the live database and sync transactions.</p><form id="login-form" class="form"><label>Email<input name="email" type="email" required></label><label>Password<input name="password" type="password" required></label><button class="primary">Sign in</button></form>${message ? `<p class="notice">${escape(message)}</p>` : ""}</section></main>`;
+  enhanceMobileTables();
   bind();
 }
 
@@ -217,11 +218,60 @@ function render(notice = "") {
     ? `<section class="card table-card sync-issues"><div class="card-title"><h2>Sync issues</h2><span>${syncIssues.length} unresolved</span></div>${syncIssues.map((issue) => `<div class="row"><div><strong>${escape(issue.reference)}</strong><small>${escape(issue.message)}</small></div><button class="secondary dismiss-sync-issue" data-issue-id="${escape(issue.id)}">Refresh &amp; dismiss</button></div>`).join("")}</section>`
     : "";
   root.innerHTML = `<main class="shell"><aside class="sidebar"><div class="brand"><span>SP</span><div><strong>SparePilot</strong><small>operations desk</small></div></div><nav>${nav()}</nav><div class="operator"><b>${escape(currentUser.full_name.slice(0, 2).toUpperCase())}</b><div><strong>${escape(currentUser.full_name)}</strong><small>${escape(currentUser.role)} · ${pendingSync ? `${pendingSync} pending` : "synced"}</small></div><button id="logout-button" class="secondary">Sign out</button></div></aside><section class="content"><header><div><p class="eyebrow">Harare pilot · warehouse / retail branch</p><h1>${title()}</h1></div><div class="sync"><i></i>${pendingSync ? `${pendingSync} pending` : "Local-first"}</div></header>${notice ? `<p class="notice">${escape(notice)}</p>` : ""}${syncIssuesPanel}${content()}</section></main>`;
+  enhanceMobileTables();
   bind();
 }
 
 function value(form: HTMLFormElement, name: string) {
   return new FormData(form).get(name)?.toString() ?? "";
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
+}
+
+function confirmAction(message: string) {
+  return window.confirm(message);
+}
+
+function setWorking(source?: HTMLElement) {
+  const button = source instanceof HTMLFormElement
+    ? source.querySelector<HTMLButtonElement>('button[type="submit"], button:not([type])')
+    : source instanceof HTMLButtonElement ? source : null;
+  if (!button) return () => undefined;
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "Working…";
+  return () => {
+    button.disabled = false;
+    button.textContent = label;
+  };
+}
+
+function enhanceMobileTables() {
+  root.querySelectorAll<HTMLTableElement>("table").forEach((table) => {
+    const labels = Array.from(table.querySelectorAll<HTMLTableCellElement>("thead th")).map((header) => header.textContent?.trim() ?? "");
+    table.querySelectorAll<HTMLTableRowElement>("tbody tr").forEach((row) => {
+      Array.from(row.cells).forEach((cell, index) => {
+        if (labels[index]) cell.dataset.label = labels[index];
+      });
+    });
+  });
+}
+
+async function completeAction(action: () => Promise<void>, success: string, nextView: View, failure: string, source?: HTMLElement) {
+  const done = setWorking(source);
+  try {
+    await action();
+    await refresh();
+    view = nextView;
+    render(success);
+  } catch (error) {
+    await refresh().catch(() => undefined);
+    render(errorMessage(error, failure));
+  } finally {
+    done();
+  }
 }
 
 function bind() {
@@ -253,19 +303,19 @@ function bind() {
   root.querySelector<HTMLFormElement>("#receipt-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget as HTMLFormElement;
-    await recordReceipt(value(form, "product"), branch("warehouse")!.id, Number(value(form, "quantity")), value(form, "supplier"));
-    await refresh();
-    view = "ledger";
-    render("Receipt saved or queued for sync.");
+    await completeAction(
+      () => recordReceipt(value(form, "product"), branch("warehouse")!.id, Number(value(form, "quantity")), value(form, "supplier")),
+      "Receipt saved or queued for sync.", "ledger", "Could not save the goods receipt.", form,
+    );
   });
 
   root.querySelector<HTMLFormElement>("#transfer-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget as HTMLFormElement;
-    await recordTransfer(value(form, "product"), branch("warehouse")!.id, branch("shop")!.id, Number(value(form, "quantity")));
-    await refresh();
-    view = "transfer";
-    render("Transfer requested or queued for sync.");
+    await completeAction(
+      () => recordTransfer(value(form, "product"), branch("warehouse")!.id, branch("shop")!.id, Number(value(form, "quantity"))),
+      "Transfer requested or queued for sync.", "transfer", "Could not request the transfer.", form,
+    );
   });
 
   root.querySelectorAll<HTMLButtonElement>(".fulfil-transfer").forEach((button) => button.addEventListener("click", async () => {
@@ -321,10 +371,10 @@ function bind() {
     const form = event.currentTarget as HTMLFormElement;
     const selected = product(value(form, "product"));
     if (!selected || !branch("shop")) return;
-    await recordSale(selected, branch("shop")!.id, Number(value(form, "quantity")), value(form, "customer") || null);
-    await refresh();
-    view = "ledger";
-    render("Sale saved or queued for sync.");
+    await completeAction(
+      () => recordSale(selected, branch("shop")!.id, Number(value(form, "quantity")), value(form, "customer") || null),
+      "Sale saved or queued for sync.", "ledger", "Could not record the sale.", form,
+    );
   });
 
   root.querySelector<HTMLFormElement>("#customer-form")?.addEventListener("submit", async (event) => {
@@ -343,77 +393,66 @@ function bind() {
   root.querySelector<HTMLFormElement>("#approval-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget as HTMLFormElement;
-    await createApproval(value(form, "type"), value(form, "subject"), currentUser?.full_name ?? "", value(form, "approver"), value(form, "priority"));
-    await refresh();
-    view = "approval";
-    render("Approval request sent.");
+    await completeAction(
+      () => createApproval(value(form, "type"), value(form, "subject"), currentUser?.full_name ?? "", value(form, "approver"), value(form, "priority")),
+      "Approval request sent.", "approval", "Could not send the approval request.", form,
+    );
   });
 
   root.querySelectorAll<HTMLButtonElement>(".approve-approval").forEach((button) => button.addEventListener("click", async () => {
     const approvalId = button.dataset.approvalId;
     if (!approvalId) return;
-    await approveApproval(approvalId);
-    await refresh();
-    view = "approval";
-    render("Approval approved.");
+    if (!confirmAction("Approve this request? This updates the linked workflow.")) return;
+    await completeAction(() => approveApproval(approvalId), "Approval approved.", "approval", "Could not approve this request.", button);
   }));
 
   root.querySelectorAll<HTMLButtonElement>(".reject-approval").forEach((button) => button.addEventListener("click", async () => {
     const approvalId = button.dataset.approvalId;
     if (!approvalId) return;
-    await rejectApproval(approvalId);
-    await refresh();
-    view = "approval";
-    render("Approval rejected.");
+    if (!confirmAction("Reject this request? This decision cannot be undone from this screen.")) return;
+    await completeAction(() => rejectApproval(approvalId), "Approval rejected.", "approval", "Could not reject this request.", button);
   }));
 
   root.querySelector<HTMLFormElement>("#expense-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget as HTMLFormElement;
-    await createExpense(value(form, "branch"), value(form, "category"), Number(value(form, "amount")), value(form, "description"));
-    await refresh();
-    view = "expense";
-    render("Expense recorded.");
+    await completeAction(
+      () => createExpense(value(form, "branch"), value(form, "category"), Number(value(form, "amount")), value(form, "description")),
+      "Expense recorded.", "expense", "Could not record the expense.", form,
+    );
   });
 
   root.querySelectorAll<HTMLButtonElement>(".approve-expense").forEach((button) => button.addEventListener("click", async () => {
     const expenseId = button.dataset.expenseId;
     if (!expenseId) return;
-    await approveExpense(expenseId);
-    await refresh();
-    view = "expense";
-    render("Expense approved.");
+    if (!confirmAction("Approve this expense? A journal entry will be posted.")) return;
+    await completeAction(() => approveExpense(expenseId), "Expense approved.", "expense", "Could not approve this expense.", button);
   }));
 
   root.querySelectorAll<HTMLButtonElement>(".reject-expense").forEach((button) => button.addEventListener("click", async () => {
     const expenseId = button.dataset.expenseId;
     if (!expenseId) return;
-    await rejectExpense(expenseId);
-    await refresh();
-    view = "expense";
-    render("Expense rejected.");
+    if (!confirmAction("Reject this expense? This decision cannot be undone from this screen.")) return;
+    await completeAction(() => rejectExpense(expenseId), "Expense rejected.", "expense", "Could not reject this expense.", button);
   }));
 
   root.querySelector<HTMLFormElement>("#purchase-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget as HTMLFormElement;
-    await createPurchaseOrder(value(form, "supplier"), value(form, "branch"), value(form, "notes"), [{ productId: value(form, "product"), quantity: Number(value(form, "quantity")), unitCost: Number(value(form, "unit-cost")) }]);
-    await refresh();
-    view = "purchase";
-    render("Purchase order queued or synced.");
+    await completeAction(
+      () => createPurchaseOrder(value(form, "supplier"), value(form, "branch"), value(form, "notes"), [{ productId: value(form, "product"), quantity: Number(value(form, "quantity")), unitCost: Number(value(form, "unit-cost")) }]),
+      "Purchase order queued or synced.", "purchase", "Could not create the purchase order.", form,
+    );
   });
 
   root.querySelector<HTMLFormElement>("#supplier-payment-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget as HTMLFormElement;
-    try {
-      await createSupplierPayment(value(form, "supplier"), value(form, "purchase_order") || null, Number(value(form, "amount")), value(form, "method"), value(form, "notes"));
-      await refresh();
-      view = "accounting";
-      render("Supplier payment recorded.");
-    } catch (error) {
-      render(error instanceof Error ? error.message : "Could not record supplier payment.");
-    }
+    if (!confirmAction(`Record a supplier payment of ${money.format(Number(value(form, "amount")))}? This posts a journal entry.`)) return;
+    await completeAction(
+      () => createSupplierPayment(value(form, "supplier"), value(form, "purchase_order") || null, Number(value(form, "amount")), value(form, "method"), value(form, "notes")),
+      "Supplier payment recorded.", "accounting", "Could not record supplier payment.", form,
+    );
   });
 
   root.querySelector<HTMLFormElement>("#user-form")?.addEventListener("submit", async (event) => {
@@ -445,6 +484,7 @@ function bind() {
   root.querySelectorAll<HTMLButtonElement>(".receive-order").forEach((button) => button.addEventListener("click", async () => {
     const orderId = button.dataset.orderId;
     if (!orderId) return;
+    if (!confirmAction("Receive this order into stock? This posts an inventory and accounting entry.")) return;
     try {
       await receivePurchaseOrder(orderId, button.dataset.orderReference ?? orderId, Number(button.dataset.orderVersion ?? 0));
       await refresh();
@@ -459,10 +499,7 @@ function bind() {
   root.querySelectorAll<HTMLButtonElement>(".mark-read").forEach((button) => button.addEventListener("click", async () => {
     const notificationId = button.dataset.notificationId;
     if (!notificationId) return;
-    await markNotificationRead(notificationId);
-    await refresh();
-    view = "notifications";
-    render("Notification marked as read.");
+    await completeAction(() => markNotificationRead(notificationId), "Notification marked as read.", "notifications", "Could not mark this notification as read.", button);
   }));
 
   root.querySelector<HTMLButtonElement>("#enable-push-button")?.addEventListener("click", async () => {

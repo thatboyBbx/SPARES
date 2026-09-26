@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 
-db_path = Path(tempfile.gettempdir()) / "spop-accounting-tests.sqlite3"
+db_path = Path(tempfile.gettempdir()) / f"spop-accounting-tests-{os.getpid()}.sqlite3"
 if db_path.exists():
     db_path.unlink()
 

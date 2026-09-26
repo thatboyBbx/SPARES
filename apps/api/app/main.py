@@ -7,13 +7,14 @@ from typing import Annotated
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from app.core.auth import create_access_token, create_refresh_token, get_current_user, hash_password, require_roles, revoke_refresh_token, rotate_refresh_token, verify_and_upgrade_password
-from app.core.config import get_settings
+from app.core.config import PILOT_PASSWORD, get_settings
 from app.core.notifications import dispatch_notification
 from app.core.permissions import CAN_APPROVE, CAN_FULFIL_TRANSFER, CAN_MANAGE_ACCOUNTING, CAN_MANAGE_STOCK_RECEIPTS, CAN_MANAGE_USERS, CAN_RECEIVE_TRANSFER, CAN_RECORD_SALE, CAN_REQUEST_PURCHASE, CAN_REQUEST_TRANSFER, CAN_VIEW_ANALYTICS
 from app.db.base import Base, SyncStatus, as_aware_utc
@@ -30,6 +31,7 @@ settings = get_settings()
 
 
 def initialize_database() -> None:
+    settings.assert_deployable()
     Base.metadata.create_all(bind=engine)
     with Session(engine) as db:
         seed_database(db)
@@ -311,6 +313,40 @@ def serialize_approval(approval: Approval) -> dict:
 def health_check() -> dict[str, str]:
     return {"status": "ok", "environment": settings.environment}
 
+
+def readiness_checks() -> dict[str, dict[str, str]]:
+    """Return dependency state without exposing connection strings or secrets."""
+    checks: dict[str, dict[str, str]] = {}
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        checks["database"] = {"status": "ok"}
+    except Exception:
+        checks["database"] = {"status": "unavailable"}
+    try:
+        from redis import Redis
+        Redis.from_url(settings.redis_url, socket_connect_timeout=1, socket_timeout=1).ping()
+        checks["redis"] = {"status": "ok"}
+    except Exception:
+        checks["redis"] = {"status": "unavailable"}
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).scalar_one()
+        checks["migrations"] = {"status": "ok"}
+    except Exception:
+        checks["migrations"] = {"status": "unavailable"}
+    return checks
+
+
+@app.get("/ready", tags=["system"])
+def readiness_check() -> JSONResponse:
+    checks = readiness_checks()
+    ready = all(check["status"] == "ok" for check in checks.values())
+    return JSONResponse(
+        status_code=status.HTTP_200_OK if ready else status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"status": "ready" if ready else "not_ready", "checks": checks},
+    )
+
 @app.get("/api/v1/bootstrap")
 def bootstrap(
     db: Session = Depends(get_db),
@@ -323,6 +359,8 @@ def bootstrap(
 
 @app.post("/api/v1/auth/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)) -> dict:
+    if settings.environment == "production" and payload.password == PILOT_PASSWORD:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")
     user = db.scalar(select(User).where(User.email == payload.email))
     if not user or not verify_and_upgrade_password(user, payload.password, db):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")
