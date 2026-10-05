@@ -62,6 +62,18 @@ def test_non_admin_cannot_manage_users() -> None:
     assert create_response.status_code == 403
 
 
+def test_bootstrap_limits_operator_data_to_role_and_branch() -> None:
+    cashier = _login("cashier@sparepilot.local")
+    payload = client.get("/api/v1/bootstrap", headers=cashier).json()
+
+    assert payload["users"] == []
+    assert payload["approvals"] == []
+    assert payload["expenses"] == []
+    assert payload["journal_entries"] == []
+    assert all(movement["branch_id"] == "branch-shop" for movement in payload["movements"])
+    assert all(sale["branch_id"] == "branch-shop" for sale in payload["sales"])
+
+
 def test_owner_can_update_user_role_and_branch() -> None:
     headers = _login("owner@sparepilot.local")
 

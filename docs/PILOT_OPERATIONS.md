@@ -1,5 +1,24 @@
 # Pilot Operations Runbook
 
+## Sites pilot
+
+The private Sites deployment is the supported pilot launch. Sites enforces the
+visitor access boundary and supplies the authenticated email used to resolve an
+operator record. On an empty database, the first authenticated visitor is
+created as Owner. The Owner creates later operators in **Users & access** using
+the exact email each person uses to open the Site, assigns a role and branch,
+and then grants that person Site access.
+
+Sites applies versioned D1 migrations during publication. Check `/ready` after
+each release; it must report the database and migrations as ready. Inventory and
+financial records remain append-only in the application state, and every update
+uses an optimistic revision check so concurrent writes fail safely for retry.
+
+Before processing real transactions, complete the role and device checks in
+`PILOT_UAT_CHECKLIST.md`. Export or record opening stock and journal totals
+before each release so a rollback can be reconciled against the append-only
+ledgers.
+
 ## Before deployment
 
 Set `ENVIRONMENT=production`, `DEBUG=false`, a unique 32+ character

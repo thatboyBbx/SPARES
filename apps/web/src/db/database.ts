@@ -39,7 +39,7 @@ export interface Approval { id: string; type: string; subject: string; requester
 export interface Expense { id: string; branchId: string; category: string; amount: number; description: string; status: string; createdAt: string; }
 export interface SupplierPayment { id: string; reference: string; supplierId: string; purchaseOrderId?: string | null; amount: number; method: string; notes: string; createdAt: string; }
 export interface JournalEntry { id: string; entryType: string; amount: number; branchId?: string | null; reference: string; description: string; relatedEntityType?: string | null; relatedEntityId?: string | null; createdBy: string; createdAt: string; }
-interface OutboxEntry { id?: number; path: string; body: string; queuedAt: string; attempts: number; }
+interface OutboxEntry { id?: number; path: string; body: string; queuedAt: string; attempts: number; lastError?: string; userId?: string; }
 
 /** A conflict (409) surfaced by a version-checked action, kept client-side
  * until the operator acknowledges it. Not a full merge UI: the mutation
@@ -97,9 +97,36 @@ export const db = new SpopDatabase();
 
 const localId = () => crypto.randomUUID();
 const timestamp = () => new Date().toISOString();
-const MAX_OUTBOX_ATTEMPTS = 5;
-async function queue(path: string, body: object) { await db.outbox.add({ path, body: JSON.stringify(body), queuedAt: timestamp(), attempts: 0 }); }
+const REPORT_FAILURE_AFTER_ATTEMPTS = 5;
+const OFFLINE_OWNER_KEY = "spop.offlineOwner";
+let activeUserId: string | null = null;
+async function clearCachedRecords() {
+  const cacheTables = db.tables.filter((table) => table.name !== "outbox");
+  await db.transaction("rw", cacheTables, async () => { await Promise.all(cacheTables.map((table) => table.clear())); });
+}
+export async function prepareOfflineWorkspace(userId: string) {
+  const owner = window.localStorage.getItem(OFFLINE_OWNER_KEY);
+  const queued = await db.outbox.count();
+  if (queued && owner !== userId) {
+    throw new Error("This device has queued transactions from another operator. Sign in as that operator and sync them before switching accounts.");
+  }
+  if (owner !== userId) await clearCachedRecords();
+  window.localStorage.setItem(OFFLINE_OWNER_KEY, userId);
+  activeUserId = userId;
+}
+export async function closeOfflineWorkspace() {
+  activeUserId = null;
+  await clearCachedRecords();
+  if (!(await db.outbox.count())) window.localStorage.removeItem(OFFLINE_OWNER_KEY);
+}
+async function queue(path: string, body: object) {
+  if (!activeUserId) throw new Error("Sign in before recording an offline transaction.");
+  await db.outbox.add({ path, body: JSON.stringify(body), queuedAt: timestamp(), attempts: 0, userId: activeUserId });
+}
 export async function pendingSyncCount() { return db.outbox.count(); }
+function shouldQueue(error: unknown): boolean {
+  return !(error instanceof ApiError) || error.status === 429 || error.status >= 500;
+}
 async function replayOutbox() {
   const entries = await db.outbox.toArray();
   for (const entry of entries) {
@@ -109,17 +136,19 @@ async function replayOutbox() {
     } catch (error) {
       const attempts = (entry.attempts ?? 0) + 1;
       if (entry.id === undefined) continue;
-      if (attempts >= MAX_OUTBOX_ATTEMPTS) {
-        await db.outbox.delete(entry.id);
+      await db.outbox.update(entry.id, { attempts, lastError: error instanceof Error ? error.message : "Unknown error" });
+      if (attempts === REPORT_FAILURE_AFTER_ATTEMPTS) {
         await request("/sync/report-failure", { method: "POST", body: JSON.stringify({ path: entry.path, error: error instanceof Error ? error.message : "Unknown error", attempts }) }).catch(() => undefined);
-      } else {
-        await db.outbox.update(entry.id, { attempts });
       }
+      // Keep the failed transaction and preserve submission order. An operator
+      // can retry it after the connection or server-side issue is resolved.
+      break;
     }
   }
 }
 
 export async function loadFromServer() {
+  if (!activeUserId) throw new Error("Sign in before syncing this device.");
   try { await replayOutbox(); } catch { /* Keep entries queued until the next successful connection. */ }
   const data = (await request("/bootstrap")) as {
     branches: Array<{ id: string; name: string; kind: "warehouse" | "shop" }>;
@@ -159,13 +188,15 @@ export async function loadFromServer() {
 }
 export async function recordReceipt(productId: string, branchId: string, quantity: number, supplierId: string) {
   const body = { product_id: productId, branch_id: branchId, supplier_id: supplierId, quantity, client_request_id: localId() };
-  try { await request("/receipts", { method: "POST", body: JSON.stringify(body) }); await loadFromServer(); }
-  catch { const reference = `OFFLINE-GRN-${Date.now()}`; await db.transaction("rw", db.movements, db.outbox, async () => { await db.movements.add({ id: localId(), productId, branchId, quantity, kind: "receipt", reference, createdAt: timestamp(), createdBy: "Offline operator" }); await queue("/receipts", body); }); }
+  try { await request("/receipts", { method: "POST", body: JSON.stringify(body) }); }
+  catch (error) { if (!shouldQueue(error)) throw error; const reference = `OFFLINE-GRN-${Date.now()}`; await db.transaction("rw", db.movements, db.outbox, async () => { await db.movements.add({ id: localId(), productId, branchId, quantity, kind: "receipt", reference, createdAt: timestamp(), createdBy: "Offline operator" }); await queue("/receipts", body); }); return; }
+  await loadFromServer();
 }
 export async function recordSale(product: Product, branchId: string, quantity: number, customerId?: string | null) {
   const body = { product_id: product.id, branch_id: branchId, quantity, customer_id: customerId || null, client_request_id: localId() };
-  try { await request("/sales", { method: "POST", body: JSON.stringify(body) }); await loadFromServer(); }
-  catch { const reference = `OFFLINE-S-${Date.now()}`; await db.transaction("rw", db.movements, db.sales, db.outbox, async () => { await db.movements.add({ id: localId(), productId: product.id, branchId, quantity: -quantity, kind: "sale", reference, createdAt: timestamp(), createdBy: "Offline operator" }); await db.sales.add({ id: localId(), productId: product.id, branchId, customerId: customerId || null, quantity, total: product.sellingPrice * quantity, receiptNumber: reference, createdAt: timestamp() }); await queue("/sales", body); }); }
+  try { await request("/sales", { method: "POST", body: JSON.stringify(body) }); }
+  catch (error) { if (!shouldQueue(error)) throw error; const reference = `OFFLINE-S-${Date.now()}`; await db.transaction("rw", db.movements, db.sales, db.outbox, async () => { await db.movements.add({ id: localId(), productId: product.id, branchId, quantity: -quantity, kind: "sale", reference, createdAt: timestamp(), createdBy: "Offline operator" }); await db.sales.add({ id: localId(), productId: product.id, branchId, customerId: customerId || null, quantity, total: product.sellingPrice * quantity, receiptNumber: reference, createdAt: timestamp() }); await queue("/sales", body); }); return; }
+  await loadFromServer();
 }
 export async function createCustomer(name: string, phone: string): Promise<Customer> {
   const customer = (await request("/customers", { method: "POST", body: JSON.stringify({ name, phone }) })) as { id: string; name: string; phone: string };
@@ -179,8 +210,9 @@ export async function recordTransfer(productId: string, fromBranchId: string, to
   // Only the request step can be queued offline: fulfilling and receiving
   // move real stock and must be verified against the live server.
   const body = { product_id: productId, from_branch_id: fromBranchId, to_branch_id: toBranchId, quantity, client_request_id: localId() };
-  try { await request("/transfers", { method: "POST", body: JSON.stringify(body) }); await loadFromServer(); }
-  catch { const reference = `OFFLINE-TRF-${Date.now()}`; await db.transaction("rw", db.transfers, db.outbox, async () => { await db.transfers.add({ id: reference, reference, productId, fromBranchId, toBranchId, quantity, status: "requested", version: 1, requestedAt: timestamp() }); await queue("/transfers", body); }); }
+  try { await request("/transfers", { method: "POST", body: JSON.stringify(body) }); }
+  catch (error) { if (!shouldQueue(error)) throw error; const reference = `OFFLINE-TRF-${Date.now()}`; await db.transaction("rw", db.transfers, db.outbox, async () => { await db.transfers.add({ id: reference, reference, productId, fromBranchId, toBranchId, quantity, status: "requested", version: 1, requestedAt: timestamp() }); await queue("/transfers", body); }); return; }
+  await loadFromServer();
 }
 export async function fulfilTransfer(transferId: string, reference: string, expectedVersion: number) {
   try {
@@ -212,8 +244,9 @@ export async function approveExpense(expenseId: string) { await request(`/expens
 export async function rejectExpense(expenseId: string) { await request(`/expenses/${expenseId}/reject`, { method: "POST" }); await loadFromServer(); }
 export async function createPurchaseOrder(supplierId: string, branchId: string, notes: string, items: Array<{ productId: string; quantity: number; unitCost: number }>) {
   const body = { supplier_id: supplierId, branch_id: branchId, notes, items: items.map((item) => ({ product_id: item.productId, quantity: item.quantity, unit_cost: item.unitCost })), client_request_id: localId() };
-  try { await request("/purchase-orders", { method: "POST", body: JSON.stringify(body) }); await loadFromServer(); }
-  catch { await queue("/purchase-orders", body); }
+  try { await request("/purchase-orders", { method: "POST", body: JSON.stringify(body) }); }
+  catch (error) { if (!shouldQueue(error)) throw error; await queue("/purchase-orders", body); return; }
+  await loadFromServer();
 }
 export async function approvePurchaseOrder(orderId: string) {
   await request(`/purchase-orders/${orderId}/approve`, { method: "POST" });

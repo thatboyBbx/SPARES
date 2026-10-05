@@ -5,7 +5,7 @@ spare parts SMEs (1 warehouse + N retail shops). Not a POS — tracks
 inventory movement, transfers, sales recording, purchasing, approvals,
 accounting, and audit trails.
 
-**Status: Phases 1–11 complete; ready for controlled pilot UAT.** Phase 10 ships a heuristic v1 (trailing
+**Status: Phases 1–11 complete; private pilot launched on Sites.** Phase 10 ships a heuristic v1 (trailing
 sales velocity, not machine learning) rather than real demand forecasting
 — see `PHASED_PLAN.md` for why that stays deferred until there's real
 production data to validate a model against.
@@ -120,6 +120,12 @@ Replace all pilot accounts before any real deployment.
 Use [the pilot UAT checklist](docs/PILOT_UAT_CHECKLIST.md) before launch and
 [the pilot operations runbook](docs/PILOT_OPERATIONS.md) for production
 configuration, readiness checks, backup/restore, and rollback procedures.
+
+The hosted pilot uses Sites private access, Sites sign-in, and its durable D1
+database. The first authenticated visitor becomes the Owner. Create subsequent
+operator records with their real sign-in email, assign the least-privileged role
+and branch, then add those people to the Site's access list. The original
+Postgres/Redis stack remains available for self-hosted deployments.
 
 ## Core MVP API
 
