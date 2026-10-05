@@ -66,3 +66,8 @@ is a deterministic, fully-explainable v1: trailing 30-day sales velocity
 projected against current stock, surfaced at
 `/api/v1/reports/replenishment-suggestions`. It's upgradeable to a real
 model later without changing the response shape callers depend on.
+
+## Phase 11 — Pilot Readiness, UAT, and Deployment Hardening ✅
+Production startup rejects unsafe defaults, pilot accounts are never seeded in
+production, and `/ready` reports database, Redis, and migration dependency
+state. The pilot runbook and role-based UAT checklist live under `docs/`.

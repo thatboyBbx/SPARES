@@ -51,6 +51,9 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      - name: Test interactions and offline sync
+        run: npm test -- --run
+
       - name: Type-check
         run: npx tsc -b
 

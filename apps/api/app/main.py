@@ -7,13 +7,14 @@ from typing import Annotated
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from app.core.auth import create_access_token, create_refresh_token, get_current_user, hash_password, require_roles, revoke_refresh_token, rotate_refresh_token, verify_and_upgrade_password
-from app.core.config import get_settings
+from app.core.config import PILOT_PASSWORD, get_settings
 from app.core.notifications import dispatch_notification
 from app.core.permissions import CAN_APPROVE, CAN_FULFIL_TRANSFER, CAN_MANAGE_ACCOUNTING, CAN_MANAGE_STOCK_RECEIPTS, CAN_MANAGE_USERS, CAN_RECEIVE_TRANSFER, CAN_RECORD_SALE, CAN_REQUEST_PURCHASE, CAN_REQUEST_TRANSFER, CAN_VIEW_ANALYTICS
 from app.db.base import Base, SyncStatus, as_aware_utc
@@ -30,6 +31,7 @@ settings = get_settings()
 
 
 def initialize_database() -> None:
+    settings.assert_deployable()
     Base.metadata.create_all(bind=engine)
     with Session(engine) as db:
         seed_database(db)
@@ -311,6 +313,40 @@ def serialize_approval(approval: Approval) -> dict:
 def health_check() -> dict[str, str]:
     return {"status": "ok", "environment": settings.environment}
 
+
+def readiness_checks() -> dict[str, dict[str, str]]:
+    """Return dependency state without exposing connection strings or secrets."""
+    checks: dict[str, dict[str, str]] = {}
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        checks["database"] = {"status": "ok"}
+    except Exception:
+        checks["database"] = {"status": "unavailable"}
+    try:
+        from redis import Redis
+        Redis.from_url(settings.redis_url, socket_connect_timeout=1, socket_timeout=1).ping()
+        checks["redis"] = {"status": "ok"}
+    except Exception:
+        checks["redis"] = {"status": "unavailable"}
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).scalar_one()
+        checks["migrations"] = {"status": "ok"}
+    except Exception:
+        checks["migrations"] = {"status": "unavailable"}
+    return checks
+
+
+@app.get("/ready", tags=["system"])
+def readiness_check() -> JSONResponse:
+    checks = readiness_checks()
+    ready = all(check["status"] == "ok" for check in checks.values())
+    return JSONResponse(
+        status_code=status.HTTP_200_OK if ready else status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"status": "ready" if ready else "not_ready", "checks": checks},
+    )
+
 @app.get("/api/v1/bootstrap")
 def bootstrap(
     db: Session = Depends(get_db),
@@ -319,10 +355,47 @@ def bootstrap(
     products = db.scalars(select(Product).order_by(Product.name)).all()
     branches = db.scalars(select(Branch).order_by(Branch.kind)).all()
     movements = db.scalars(select(StockMovement).order_by(StockMovement.created_at.desc())).all()
-    return {"users": [serialize(u) for u in db.scalars(select(User)).all()], "products": [serialize(p) for p in products], "categories": [serialize(c) for c in db.scalars(select(Category).order_by(Category.name)).all()], "branches": [serialize(b) for b in branches], "suppliers": [serialize(s) for s in db.scalars(select(Supplier)).all()], "customers": [serialize(c) for c in db.scalars(select(Customer).order_by(Customer.name)).all()], "movements": [serialize(m) for m in movements], "transfers": [serialize(t) for t in db.scalars(select(Transfer).order_by(Transfer.created_at.desc())).all()], "sales": [serialize(s) for s in db.scalars(select(Sale).order_by(Sale.created_at.desc())).all()], "purchase_orders": [serialize(o) for o in db.scalars(select(PurchaseOrder).order_by(PurchaseOrder.requested_at.desc())).all()], "purchase_order_lines": [serialize(l) for l in db.scalars(select(PurchaseOrderLine).order_by(PurchaseOrderLine.created_at.desc())).all()], "approvals": [serialize_approval(a) for a in db.scalars(select(Approval).order_by(Approval.created_at.desc())).all()], "expenses": [serialize(e) for e in db.scalars(select(Expense).order_by(Expense.created_at.desc())).all()], "notifications": [serialize(n) for n in db.scalars(select(Notification).order_by(Notification.created_at.desc())).all()], "supplier_payments": [serialize(p) for p in db.scalars(select(SupplierPayment).order_by(SupplierPayment.created_at.desc())).all()] if current_user.role in CAN_MANAGE_ACCOUNTING else [], "journal_entries": [serialize(j) for j in db.scalars(select(JournalEntry).order_by(JournalEntry.created_at.desc())).all()] if current_user.role in CAN_MANAGE_ACCOUNTING else []}
+    role = current_user.role
+    branch_id = current_user.branch_id if role in (UserRole.CASHIER, UserRole.SHOP_MANAGER) else None
+    if branch_id:
+        movements = [movement for movement in movements if movement.branch_id == branch_id]
+    transfers = db.scalars(select(Transfer).order_by(Transfer.created_at.desc())).all() if role in CAN_REQUEST_TRANSFER else []
+    if branch_id:
+        transfers = [transfer for transfer in transfers if branch_id in (transfer.from_branch_id, transfer.to_branch_id)]
+    sales = db.scalars(select(Sale).order_by(Sale.created_at.desc())).all() if role in (*CAN_RECORD_SALE, UserRole.ACCOUNTANT) else []
+    if branch_id:
+        sales = [sale for sale in sales if sale.branch_id == branch_id]
+    orders = db.scalars(select(PurchaseOrder).order_by(PurchaseOrder.requested_at.desc())).all() if role in CAN_REQUEST_PURCHASE else []
+    if branch_id:
+        orders = [order for order in orders if order.branch_id == branch_id]
+    order_ids = {order.id for order in orders}
+    visible_customer_ids = {sale.customer_id for sale in sales if sale.customer_id}
+    customers = db.scalars(select(Customer).order_by(Customer.name)).all() if role in CAN_RECORD_SALE else []
+    if branch_id:
+        customers = [customer for customer in customers if customer.id in visible_customer_ids or customer.created_by_id == current_user.id]
+    return {
+        "users": [serialize(u) for u in db.scalars(select(User)).all()] if role in CAN_MANAGE_USERS else [],
+        "products": [serialize(p) for p in products],
+        "categories": [serialize(c) for c in db.scalars(select(Category).order_by(Category.name)).all()],
+        "branches": [serialize(b) for b in branches],
+        "suppliers": [serialize(s) for s in db.scalars(select(Supplier)).all()] if role in (*CAN_REQUEST_PURCHASE, *CAN_MANAGE_ACCOUNTING) else [],
+        "customers": [serialize(c) for c in customers],
+        "movements": [serialize(m) for m in movements],
+        "transfers": [serialize(t) for t in transfers],
+        "sales": [serialize(s) for s in sales],
+        "purchase_orders": [serialize(o) for o in orders],
+        "purchase_order_lines": [serialize(line) for line in db.scalars(select(PurchaseOrderLine)).all() if line.purchase_order_id in order_ids],
+        "approvals": [serialize_approval(a) for a in db.scalars(select(Approval).order_by(Approval.created_at.desc())).all()] if role in CAN_APPROVE else [],
+        "expenses": [serialize(e) for e in db.scalars(select(Expense).order_by(Expense.created_at.desc())).all()] if role in CAN_MANAGE_ACCOUNTING else [],
+        "notifications": [serialize(n) for n in db.scalars(select(Notification).order_by(Notification.created_at.desc())).all()],
+        "supplier_payments": [serialize(p) for p in db.scalars(select(SupplierPayment).order_by(SupplierPayment.created_at.desc())).all()] if role in CAN_MANAGE_ACCOUNTING else [],
+        "journal_entries": [serialize(j) for j in db.scalars(select(JournalEntry).order_by(JournalEntry.created_at.desc())).all()] if role in CAN_MANAGE_ACCOUNTING else [],
+    }
 
 @app.post("/api/v1/auth/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)) -> dict:
+    if settings.environment == "production" and payload.password == PILOT_PASSWORD:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")
     user = db.scalar(select(User).where(User.email == payload.email))
     if not user or not verify_and_upgrade_password(user, payload.password, db):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")

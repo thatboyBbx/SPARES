@@ -1,5 +1,6 @@
 """Smoke tests that the Alembic migration chain applies cleanly end to end,
 independent of the create_all() fallback the rest of the test suite uses."""
+import os
 import tempfile
 from pathlib import Path
 
@@ -16,7 +17,7 @@ def _config_for(db_path: Path) -> Config:
 
 
 def test_upgrade_head_applies_cleanly_on_a_fresh_database() -> None:
-    db_path = Path(tempfile.gettempdir()) / "spop-migrations-fresh.sqlite3"
+    db_path = Path(tempfile.gettempdir()) / f"spop-migrations-fresh-{os.getpid()}.sqlite3"
     if db_path.exists():
         db_path.unlink()
     try:
@@ -27,7 +28,7 @@ def test_upgrade_head_applies_cleanly_on_a_fresh_database() -> None:
 
 
 def test_downgrade_to_base_and_back_to_head_round_trips() -> None:
-    db_path = Path(tempfile.gettempdir()) / "spop-migrations-roundtrip.sqlite3"
+    db_path = Path(tempfile.gettempdir()) / f"spop-migrations-roundtrip-{os.getpid()}.sqlite3"
     if db_path.exists():
         db_path.unlink()
     try:

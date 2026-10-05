@@ -6,10 +6,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.auth import hash_password
+from app.core.config import get_settings
 from app.models import Branch, Product, PurchaseReceipt, StockMovement, Supplier, User, UserRole
 
 
 def seed_database(db: Session) -> None:
+    # A new production database must be provisioned deliberately; it must
+    # never receive the well-known pilot accounts.
+    if get_settings().environment == "production":
+        return
     if db.scalar(select(Product.id).limit(1)):
         return
     data_path = Path(__file__).with_name("data") / "sample_data.json"
